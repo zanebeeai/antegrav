@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Clear a latched E-STOP on the Ethon EV.
+#
+# ethon_drive.py latches the e-stop and stays disabled until the PROCESS
+# restarts (a deliberate safety design — a stale `/ethon/estop false` must not
+# silently re-arm the motors). The drive node runs inside ethon-stack, so the
+# only way to clear the latch is to bounce the whole autonomy stack. This also
+# resets health_monitor's estop reflex. The planner boots DISARMED, so the car
+# stays stationary after the restart.
+#
+# Callers (wheel_bridge.py ARM+DISARM hold, or the web dashboard CLEAR E-STOP
+# button) publish `/ethon/estop false` FIRST, so the restarted drive comes up
+# with a cleared latched topic value.
+#
+# Invoked as:  sudo -n /home/jetson/ethon/ethon_clear_estop.sh
+# Needs the /etc/sudoers.d/ethon-clear-estop drop-in (NOPASSWD, this script only).
+set -euo pipefail
+
+systemctl restart ethon-stack.service

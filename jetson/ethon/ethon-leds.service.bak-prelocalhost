@@ -1,0 +1,33 @@
+# ethon-leds.service — NeoPixel roll-cage lighting (rear brake/tail + front DRL)
+#
+# Runs ALWAYS, in both capture and autonomy modes: this node owns only the SPI
+# bus (/dev/spidev0.0), not the CSI cameras or CAN, so like ethon-hmi/ethon-lap
+# it has no Conflicts= and is safe to leave enabled all the time. Output-only.
+#
+# The jetson user must be in the 'gpio' group to open /dev/spidev0.0 (it already
+# is). No sudoers drop-in needed. Set N_REAR / N_FRONT in led_lights.py to your
+# physical strip before enabling, and bench-check with:
+#     python3 /home/jetson/ethon/led_lights.py --selftest
+#
+# Install:
+#     sudo cp /home/jetson/ethon/ethon-leds.service /etc/systemd/system/
+#     sudo systemctl daemon-reload && sudo systemctl enable --now ethon-leds
+
+[Unit]
+Description=Ethon NeoPixel lighting (brake/tail + DRL)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=jetson
+WorkingDirectory=/home/jetson/ethon
+ExecStart=/bin/bash -lc 'source /opt/ros/humble/setup.bash && export ROS_DOMAIN_ID=42 RMW_IMPLEMENTATION=rmw_cyclonedds_cpp && exec python3 /home/jetson/ethon/led_lights.py'
+Restart=on-failure
+RestartSec=5
+# SIGINT so rclpy shuts the node down cleanly (clears the strip on the way out)
+KillSignal=SIGINT
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

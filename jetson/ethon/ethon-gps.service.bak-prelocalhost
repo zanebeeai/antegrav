@@ -1,0 +1,21 @@
+# ethon-gps.service — Radiolink M10N GPS driver (NMEA /dev/ttyTHS1 -> /gps/fix)
+#
+# Runs always; only owns the UART /dev/ttyTHS1, no camera/CAN conflict. Feeds
+# lap_timer.py (/gps/fix). jetson user is in 'dialout' to open the UART.
+[Unit]
+Description=Ethon GPS driver (M10N NMEA -> /gps/fix)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=jetson
+WorkingDirectory=/home/jetson/ethon
+ExecStart=/bin/bash -lc 'source /opt/ros/humble/setup.bash && export ROS_DOMAIN_ID=42 RMW_IMPLEMENTATION=rmw_cyclonedds_cpp && exec python3 /home/jetson/ethon/gps_driver.py'
+Restart=on-failure
+RestartSec=5
+KillSignal=SIGINT
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,31 @@
+# ethon-hmi.service — Nextion steering-wheel HMI (driver dashboard + soft buttons)
+#
+# Runs ALWAYS, in both capture and autonomy modes: this node owns only the UART
+# (/dev/ttyTHS1), not the CSI cameras, so unlike ethon-stack/ethon-capture it has
+# no Conflicts= and is safe to leave enabled all the time.
+#
+# The jetson user must be in the 'dialout' group to open /dev/ttyTHS1, and the
+# /etc/sudoers.d/ethon-hmi drop-in must be installed for the mode button to work.
+#
+# Install:
+#     sudo cp /home/jetson/ethon/ethon-hmi.service /etc/systemd/system/
+#     sudo systemctl daemon-reload && sudo systemctl enable --now ethon-hmi
+
+[Unit]
+Description=Ethon Nextion HMI (driver dashboard + soft buttons)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=jetson
+WorkingDirectory=/home/jetson/ethon
+ExecStart=/bin/bash -lc 'source /opt/ros/humble/setup.bash && export ROS_DOMAIN_ID=42 RMW_IMPLEMENTATION=rmw_cyclonedds_cpp && exec python3 /home/jetson/ethon/nextion_hmi.py'
+Restart=on-failure
+RestartSec=5
+# SIGINT so rclpy shuts the node down cleanly (writes "HMI offline" to the panel)
+KillSignal=SIGINT
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

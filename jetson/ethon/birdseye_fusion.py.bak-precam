@@ -1,0 +1,495 @@
+#!/usr/bin/env python3
+"""
+Bird's-eye fusion v2 — multi-camera detection -> ground-plane projection.
+
+Owns every perception camera on the vehicle (one process, one GPU context):
+  * Jetson CSI cams (nvarguscamerasrc sensor-id 0 front IMX477, 1 right IMX219)
+  * perc-1 Pi5 TCP MJPEG streams (4-byte big-endian length prefix + JPEG)
+    on ports 5001 (OV5647) and 5002 (IMX708), reachable via LAN or Tailscale.
+
+Every capture source runs a background thread that fills a 1-slot
+latest-frame buffer (old frames dropped), so the 10 Hz fusion loop never
+blocks on I/O.  One shared YOLO TensorRT model runs inference round-robin
+over all sources each tick; sources without a fresh frame are skipped.
+
+Ground projection: a detection is assumed to touch the ground at the
+bottom-center of its bounding box (true for cones, people, vehicles); that
+pixel maps through the camera's 3x3 homography to (x, y) metres in
+base_link (x forward, y left, origin = rear axle center).
+
+Calibration (see calibrate_homography.py), in /home/jetson/ethon/calib/:
+  CSI source N  -> cam{N}_H.npy
+  TCP port P    -> cam_tcp{P}_H.npy
+A source with no homography still runs, but its detections are published
+ONLY on the raw debug topic — pixel coordinates must never reach the
+planner topics.  Missing files are re-checked every 10 s, so calibrating
+does not require a node restart.
+
+Publishes:
+  /ethon/obstacles       PoseArray  all calibrated detections (class id in z)
+  /ethon/cones           PoseArray  cone-class calibrated detections only
+  /ethon/detections_raw  String     one JSON object per detection (all
+                                    sources, calibrated or not):
+                                    {source, cls, conf, bbox:[x1,y1,x2,y2]}
+  /ethon/fusion_status   String     1 Hz JSON health: per-source alive /
+                                    calibrated / fps / detection counts
+
+Parameters:
+  model_path      (string) TRT engine path, default ethon_v1.engine
+  enable_<source> (bool)   per-source enable flag, default True
+"""
+
+import json
+import signal
+import socket
+import struct
+import threading
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import cv2
+import numpy as np
+
+import rclpy
+from rclpy.node import Node
+from geometry_msgs.msg import Pose, PoseArray
+from std_msgs.msg import String
+
+from ultralytics import YOLO
+
+# ---------------------------------------------------------------- constants
+DEFAULT_MODEL_PATH = "/home/jetson/ethon/models/ethon_v1.engine"
+CALIB_DIR          = Path("/home/jetson/ethon/calib")
+FRAME_ID           = "base_link"
+
+CONF_THRESHOLD = 0.45
+IMG_SIZE       = 640
+USE_HALF       = True
+CONE_CLS       = 0            # ethon_v1 / road_v1 class 0 = cone
+
+FUSION_PERIOD_S  = 0.10       # 10 Hz fusion loop
+STATUS_PERIOD_S  = 1.0        # 1 Hz /ethon/fusion_status
+HOUSEKEEP_PERIOD_S = 10.0     # stats log + homography re-check
+
+CSI_WIDTH, CSI_HEIGHT, CSI_FPS = 1280, 720, 30
+CSI_RETRY_S = 10.0            # re-open attempt period for a dead CSI cam
+
+PERC1_HOSTS = ["192.168.0.101", "100.86.169.68"]   # LAN, then Tailscale
+TCP_BACKOFF_S         = 3.0   # reconnect backoff (rotates through hosts)
+TCP_CONNECT_TIMEOUT_S = 2.0
+TCP_RECV_TIMEOUT_S    = 5.0
+TCP_MAX_JPEG_BYTES    = 8 * 1024 * 1024            # length-prefix sanity cap
+LEN_PREFIX            = struct.Struct(">I")
+
+
+# ---------------------------------------------------------- source registry
+@dataclass(frozen=True)
+class SourceSpec:
+    """Static description of one camera source."""
+    name: str                              # unique label, used in topics/logs
+    kind: str                              # "csi" | "tcp"
+    sensor_id: int = -1                    # CSI only
+    hosts: Tuple[str, ...] = ()            # TCP only, tried in order
+    port: int = -1                         # TCP only
+    enabled: bool = True                   # default; overridable via ROS param
+
+    @property
+    def h_file(self) -> Path:
+        if self.kind == "csi":
+            return CALIB_DIR / f"cam{self.sensor_id}_H.npy"
+        return CALIB_DIR / f"cam_tcp{self.port}_H.npy"
+
+
+SOURCES: List[SourceSpec] = [
+    SourceSpec(name="csi0_front", kind="csi", sensor_id=0),
+    SourceSpec(name="csi1_right", kind="csi", sensor_id=1),
+    SourceSpec(name="tcp5001", kind="tcp", hosts=tuple(PERC1_HOSTS), port=5001),
+    SourceSpec(name="tcp5002", kind="tcp", hosts=tuple(PERC1_HOSTS), port=5002),
+]
+
+
+def gst_pipeline(sensor_id: int) -> str:
+    """nvarguscamerasrc pipeline delivering BGR frames, latest-only appsink."""
+    return (
+        f"nvarguscamerasrc sensor-id={sensor_id} wbmode=1 ! "
+        f"video/x-raw(memory:NVMM),width={CSI_WIDTH},height={CSI_HEIGHT},"
+        f"framerate={CSI_FPS}/1 ! "
+        "nvvidconv ! video/x-raw,format=BGRx ! "
+        "videoconvert ! video/x-raw,format=BGR ! "
+        "appsink drop=true max-buffers=1 sync=false"
+    )
+
+
+def _recv_exact(sock: socket.socket, n: int) -> bytes:
+    """Read exactly n bytes or raise ConnectionError on EOF."""
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise ConnectionError("peer closed connection")
+        buf.extend(chunk)
+    return bytes(buf)
+
+
+# ----------------------------------------------------------- frame sources
+class FrameSource:
+    """Background-threaded capture with a 1-slot latest-frame buffer."""
+
+    def __init__(self, spec: SourceSpec, logger):
+        self.spec = spec
+        self._log = logger
+        self._lock = threading.Lock()
+        self._frame: Optional[np.ndarray] = None
+        self._seq = 0
+        self._stop = threading.Event()
+        self._alive = False
+        self._thread = threading.Thread(
+            target=self._run, name=f"src-{spec.name}", daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self, join_timeout: float = 3.0) -> None:
+        """Signal the capture loop and wait for it to release the device.
+
+        Joining matters on CSI sources: nvargus/gstreamer must finish
+        cap.release() on its own thread before the interpreter tears down,
+        otherwise the native pipeline aborts (SIGABRT core dump) on exit.
+        """
+        self._stop.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=join_timeout)
+
+    @property
+    def alive(self) -> bool:
+        return self._alive
+
+    def latest(self) -> Optional[Tuple[np.ndarray, int]]:
+        """Return (frame, seq) of the newest frame, or None if none yet."""
+        with self._lock:
+            if self._frame is None:
+                return None
+            return self._frame, self._seq
+
+    def _store(self, frame: np.ndarray) -> None:
+        with self._lock:
+            self._frame = frame
+            self._seq += 1
+
+    def _run(self) -> None:  # pragma: no cover - overridden
+        raise NotImplementedError
+
+
+class CsiSource(FrameSource):
+    """Jetson CSI camera via nvarguscamerasrc; re-opens every CSI_RETRY_S."""
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            cap = cv2.VideoCapture(
+                gst_pipeline(self.spec.sensor_id), cv2.CAP_GSTREAMER)
+            if not cap.isOpened():
+                cap.release()
+                self._alive = False
+                self._log.warn(
+                    f"[{self.spec.name}] CSI open failed, "
+                    f"retrying in {CSI_RETRY_S:.0f}s")
+                if self._stop.wait(CSI_RETRY_S):
+                    return
+                continue
+            self._log.info(f"[{self.spec.name}] CSI camera opened")
+            self._alive = True
+            while not self._stop.is_set():
+                ok, frame = cap.read()
+                if not ok:
+                    self._log.warn(
+                        f"[{self.spec.name}] frame read failed, re-opening")
+                    break
+                self._store(frame)
+            cap.release()
+            self._alive = False
+            if not self._stop.is_set() and self._stop.wait(CSI_RETRY_S):
+                return
+
+
+class TcpSource(FrameSource):
+    """Length-prefixed MJPEG over TCP; rotates hosts, 3 s reconnect backoff."""
+
+    def _run(self) -> None:
+        host_idx = 0
+        while not self._stop.is_set():
+            host = self.spec.hosts[host_idx % len(self.spec.hosts)]
+            host_idx += 1
+            try:
+                sock = socket.create_connection(
+                    (host, self.spec.port), timeout=TCP_CONNECT_TIMEOUT_S)
+                sock.settimeout(TCP_RECV_TIMEOUT_S)
+            except OSError:
+                self._alive = False
+                if self._stop.wait(TCP_BACKOFF_S):
+                    return
+                continue
+            self._log.info(
+                f"[{self.spec.name}] connected to {host}:{self.spec.port}")
+            self._alive = True
+            try:
+                with sock:
+                    self._recv_loop(sock)
+            except (OSError, ConnectionError, struct.error) as exc:
+                self._log.warn(
+                    f"[{self.spec.name}] stream lost ({exc}), "
+                    f"reconnecting in {TCP_BACKOFF_S:.0f}s")
+            self._alive = False
+            if self._stop.wait(TCP_BACKOFF_S):
+                return
+
+    def _recv_loop(self, sock: socket.socket) -> None:
+        while not self._stop.is_set():
+            size = LEN_PREFIX.unpack(_recv_exact(sock, LEN_PREFIX.size))[0]
+            if not 0 < size <= TCP_MAX_JPEG_BYTES:
+                raise ConnectionError(f"bad frame size {size} (desync)")
+            jpeg = _recv_exact(sock, size)
+            frame = cv2.imdecode(
+                np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR)
+            if frame is not None:        # corrupt JPEG: skip, keep stream
+                self._store(frame)
+
+
+# ------------------------------------------------------------- statistics
+@dataclass
+class SourceStats:
+    """Rolling per-source counters, reset at each housekeeping log."""
+    frames: int = 0
+    detections: int = 0
+    window_start: float = field(default_factory=time.monotonic)
+
+    def fps(self) -> float:
+        elapsed = time.monotonic() - self.window_start
+        return self.frames / elapsed if elapsed > 0.5 else 0.0
+
+    def reset(self) -> None:
+        self.frames = 0
+        self.detections = 0
+        self.window_start = time.monotonic()
+
+
+# ------------------------------------------------------------------- node
+class BirdseyeFusion(Node):
+    """Multi-source YOLO fusion publishing ground-frame obstacle positions."""
+
+    def __init__(self):
+        super().__init__("birdseye_fusion")
+
+        self._model_path = self.declare_parameter(
+            "model_path", DEFAULT_MODEL_PATH).value
+        self.get_logger().info(f"loading model {self._model_path}")
+        try:
+            self.model = YOLO(self._model_path, task="detect")
+            # Warm-up so the first real tick doesn't stall on engine init.
+            self.model(np.zeros((CSI_HEIGHT, CSI_WIDTH, 3), dtype=np.uint8),
+                       verbose=False, imgsz=IMG_SIZE,
+                       half=USE_HALF, conf=CONF_THRESHOLD)
+        except Exception as exc:
+            self.get_logger().fatal(f"model load failed: {exc}")
+            raise
+
+        self.sources: Dict[str, FrameSource] = {}
+        self.homography: Dict[str, Optional[np.ndarray]] = {}
+        self.stats: Dict[str, SourceStats] = {}
+        self._last_seq: Dict[str, int] = {}
+        self._rr_offset = 0
+
+        for spec in SOURCES:
+            enabled = self.declare_parameter(
+                f"enable_{spec.name}", spec.enabled).value
+            if not enabled:
+                self.get_logger().info(f"[{spec.name}] disabled by parameter")
+                continue
+            cls = CsiSource if spec.kind == "csi" else TcpSource
+            src = cls(spec, self.get_logger())
+            src.start()
+            self.sources[spec.name] = src
+            self.stats[spec.name] = SourceStats()
+            self._last_seq[spec.name] = -1
+            self.homography[spec.name] = self._load_h(spec, announce=True)
+
+        self.pub_obstacles = self.create_publisher(
+            PoseArray, "/ethon/obstacles", 10)
+        self.pub_cones = self.create_publisher(PoseArray, "/ethon/cones", 10)
+        self.pub_raw = self.create_publisher(
+            String, "/ethon/detections_raw", 10)
+        self.pub_status = self.create_publisher(
+            String, "/ethon/fusion_status", 10)
+
+        self.create_timer(FUSION_PERIOD_S, self._tick)
+        self.create_timer(STATUS_PERIOD_S, self._publish_status)
+        self.create_timer(HOUSEKEEP_PERIOD_S, self._housekeep)
+
+    # ---------------------------------------------------------- calibration
+    def _load_h(self, spec: SourceSpec, announce: bool = False
+                ) -> Optional[np.ndarray]:
+        """Load the source's homography, or None if absent/invalid."""
+        if not spec.h_file.exists():
+            if announce:
+                self.get_logger().warn(
+                    f"[{spec.name}] no homography ({spec.h_file}) — "
+                    "detections go to /ethon/detections_raw ONLY. "
+                    "Run calibrate_homography.py.")
+            return None
+        try:
+            h = np.load(spec.h_file)
+            if h.shape != (3, 3):
+                raise ValueError(f"bad shape {h.shape}, expected (3, 3)")
+        except (OSError, ValueError) as exc:
+            self.get_logger().error(
+                f"[{spec.name}] homography load failed: {exc}")
+            return None
+        if announce:
+            self.get_logger().info(f"[{spec.name}] loaded {spec.h_file}")
+        return h
+
+    # ---------------------------------------------------------- fusion loop
+    def _tick(self) -> None:
+        stamp = self.get_clock().now().to_msg()
+        obstacles = PoseArray()
+        obstacles.header.stamp = stamp
+        obstacles.header.frame_id = FRAME_ID
+        cones = PoseArray()
+        cones.header.stamp = stamp
+        cones.header.frame_id = FRAME_ID
+
+        # Round-robin start order so no source monopolizes a slow tick.
+        names = list(self.sources)
+        if not names:
+            return
+        self._rr_offset = (self._rr_offset + 1) % len(names)
+        ordered = names[self._rr_offset:] + names[:self._rr_offset]
+
+        for name in ordered:
+            latest = self.sources[name].latest()
+            if latest is None:
+                continue
+            frame, seq = latest
+            if seq == self._last_seq[name]:
+                continue                      # no fresh frame this tick
+            self._last_seq[name] = seq
+            self.stats[name].frames += 1
+
+            result = self.model(frame, verbose=False, imgsz=IMG_SIZE,
+                                half=USE_HALF, conf=CONF_THRESHOLD)
+            boxes = result[0].boxes
+            if boxes is None or len(boxes) == 0:
+                continue
+            self.stats[name].detections += len(boxes)
+            self._process_boxes(name, boxes, obstacles, cones)
+
+        self.pub_obstacles.publish(obstacles)
+        self.pub_cones.publish(cones)
+
+    def _process_boxes(self, name: str, boxes, obstacles: PoseArray,
+                       cones: PoseArray) -> None:
+        """Project one source's detections; route by calibration state."""
+        h = self.homography[name]
+        for box in boxes:
+            x1, y1, x2, y2 = (float(v) for v in box.xyxy[0])
+            cls_id = int(box.cls[0])
+            conf = float(box.conf[0])
+
+            raw = String()
+            raw.data = json.dumps({
+                "source": name, "cls": cls_id, "conf": round(conf, 3),
+                "bbox": [round(x1, 1), round(y1, 1),
+                         round(x2, 1), round(y2, 1)],
+            })
+            self.pub_raw.publish(raw)
+
+            if h is None:
+                continue    # uncalibrated: debug topic only, never planner
+            u, v = (x1 + x2) / 2.0, y2        # ground contact pixel
+            gx, gy, gw = h @ np.array([u, v, 1.0])
+            if abs(gw) < 1e-9:
+                continue                       # degenerate projection
+            pose = Pose()
+            pose.position.x = float(gx / gw)
+            pose.position.y = float(gy / gw)
+            pose.position.z = float(cls_id)    # class id smuggled in z
+            obstacles.poses.append(pose)
+            if cls_id == CONE_CLS:
+                cones.poses.append(pose)
+
+    # --------------------------------------------------------------- status
+    def _publish_status(self) -> None:
+        msg = String()
+        msg.data = json.dumps({
+            "stamp": time.time(),
+            "model": self._model_path,
+            "sources": {
+                spec.name: self._source_status(spec) for spec in SOURCES
+            },
+        })
+        self.pub_status.publish(msg)
+
+    def _source_status(self, spec: SourceSpec) -> dict:
+        if spec.name not in self.sources:
+            return {"enabled": False}
+        return {
+            "enabled": True,
+            "alive": self.sources[spec.name].alive,
+            "calibrated": self.homography[spec.name] is not None,
+            "fps": round(self.stats[spec.name].fps(), 1),
+            "detections": self.stats[spec.name].detections,
+        }
+
+    def _housekeep(self) -> None:
+        """Every 10 s: log per-source stats, re-check missing homographies."""
+        parts = []
+        for name, src in self.sources.items():
+            st = self.stats[name]
+            spec = src.spec
+            if self.homography[name] is None:
+                refreshed = self._load_h(spec)
+                if refreshed is not None:
+                    self.homography[name] = refreshed
+                    self.get_logger().info(
+                        f"[{name}] homography appeared — now feeding planner")
+            calib = "cal" if self.homography[name] is not None else "RAW"
+            state = "up" if src.alive else "DOWN"
+            parts.append(f"{name}: {st.fps():.1f}fps "
+                         f"{st.detections}det {state} {calib}")
+            st.reset()
+        self.get_logger().info("stats | " + " | ".join(parts))
+
+    def shutdown(self) -> None:
+        for src in self.sources.values():
+            src.stop()
+
+
+def _on_term(signum, _frame):
+    raise SystemExit(signum)
+
+
+def main():
+    rclpy.init()
+    node = BirdseyeFusion()
+
+    # systemd stops this node with SIGTERM (mode switch / stack stop). Turn it
+    # into SystemExit so the finally block runs and the camera threads are
+    # joined+released cleanly -- otherwise the nvargus pipeline aborts on exit.
+    signal.signal(signal.SIGTERM, _on_term)
+
+    try:
+        rclpy.spin(node)
+    except (KeyboardInterrupt, SystemExit):
+        pass
+    finally:
+        node.shutdown()           # joins capture threads -> releases nvargus
+        node.destroy_node()
+        try:
+            rclpy.shutdown()
+        except Exception:
+            pass  # context may already be down (external shutdown)
+
+
+if __name__ == "__main__":
+    main()

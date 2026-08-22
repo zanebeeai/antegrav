@@ -1,0 +1,12 @@
+[Unit]
+Description=Bring up can0 in CAN FD mode for Krakens
+Before=ethon-drive.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/ip link set can0 up type can bitrate 1000000 dbitrate 2000000 fd on restart-ms 100
+ExecStop=/usr/sbin/ip link set can0 down
+
+[Install]
+WantedBy=multi-user.target

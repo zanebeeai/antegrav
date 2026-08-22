@@ -1,0 +1,2216 @@
+#!/usr/bin/env python3
+"""Ethon web debug dashboard (team 843).
+
+A browser dashboard for the EV, served straight off the Jetson at
+    http://<jetson-ip>/dashboard      (port 80)
+
+It is a ROS2 node that subscribes to *every* topic on the graph, caches the
+latest message of each, and exposes them — plus live parameter editing and the
+same ARM / DISARM / E-STOP / MARK / MODE actions as the steering wheel — over a
+tiny JSON API. The single-page UI (embedded below, no external files) polls that
+API a few times a second.
+
+Design notes
+------------
+* Pure standard-library HTTP server (http.server.ThreadingHTTPServer) so there
+  is nothing to ``pip install`` on the Jetson — robust if it is offline.
+* Generic topic echo via rosidl_runtime_py.message_to_ordereddict, so any
+  message type renders without per-type code. Big array messages (PoseArray /
+  Path) are summarised to a count to keep the payload small.
+* Subscriptions are BEST_EFFORT so they are QoS-compatible with every publisher
+  (a best-effort reader accepts both reliable and best-effort writers);
+  /ethon/estop additionally uses TRANSIENT_LOCAL so the latched value shows up.
+* Parameter get/list/set go through the standard rcl_interfaces services, so any
+  node's parameters can be read and edited live (matches ``ros2 param``).
+* Actions mirror wheel_bridge.py exactly (same topics, same latched E-STOP QoS,
+  same sudo ethon_set_mode.sh for mode), so the wheel and the dashboard stay in
+  lock-step.
+
+Read-only by nature except for the explicit param edits and action buttons.
+Runs as ethon-dashboard.service (User=jetson, CAP_NET_BIND_SERVICE for port 80).
+"""
+
+import array
+import csv
+import json
+import os
+import shutil
+import threading
+import time
+import subprocess
+from collections import deque
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse, parse_qs
+
+import rclpy
+from rclpy.node import Node
+from rclpy.executors import MultiThreadedExecutor
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
+from std_msgs.msg import Bool, Empty, String, Float64
+from rcl_interfaces.srv import ListParameters, GetParameters, SetParameters
+from rcl_interfaces.msg import Parameter, ParameterValue, ParameterType, Log
+from rosidl_runtime_py.convert import message_to_ordereddict
+from rosidl_runtime_py.utilities import get_message
+
+HTTP_PORT = int(os.environ.get("ETHON_DASH_PORT", "80"))
+MODE_SCRIPT = "/home/jetson/ethon/ethon_set_mode.sh"
+CLEAR_ESTOP_SCRIPT = "/home/jetson/ethon/ethon_clear_estop.sh"
+
+SKIP_TOPICS = {"/parameter_events", "/rosout"}
+# only these nodes are offered in the parameter editor (the rest have nothing
+# user-tunable); discovered live, intersected with whatever is actually running.
+PARAM_NODES = [
+    "/cone_corridor_planner", "/lap_timer", "/ethon_drive",
+    "/gps_driver", "/birdseye_fusion", "/health_monitor",
+    "/race_strategist", "/corridor_warning",
+]
+PARAM_NOISE_PREFIX = ("qos_overrides",)
+PARAM_NOISE = {"use_sim_time", "start_type_description_service"}
+
+HIST_HZ = 4.0                 # history sampling rate (charts + track)
+# Annotated camera previews written by birdseye_fusion into tmpfs.
+CAM_DIR = "/dev/shm"
+CAM_PREFIX = "ethon_cam_"
+CAM_STALE_S = 5.0             # older than this and the source counts as dead
+
+
+def _list_cams():
+    """Source names with a preview frame that is actually fresh."""
+    out = []
+    try:
+        now = time.time()
+        for fn in sorted(os.listdir(CAM_DIR)):
+            if not (fn.startswith(CAM_PREFIX) and fn.endswith(".jpg")):
+                continue
+            full = os.path.join(CAM_DIR, fn)
+            try:
+                if now - os.path.getmtime(full) <= CAM_STALE_S:
+                    out.append(fn[len(CAM_PREFIX):-4])
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return out
+
+
+# Matches calibrate_homography.py's CALIB_DIR/snapshot_path()/homography_path()
+# exactly, so "already calibrated" here means the same thing birdseye_fusion
+# checks -- this module deliberately does not import that script (kept as an
+# independent CLI tool with no dependents), so the path is duplicated here.
+CALIB_DIR = "/home/jetson/ethon/calib"
+
+
+def _list_calib_snapshots():
+    """Snapshot files ready for the /calib pixel-picker, keyed by source."""
+    out = {}
+    try:
+        for fn in sorted(os.listdir(CALIB_DIR)):
+            if not fn.endswith("_snapshot.jpg"):
+                continue
+            key = fn[: -len("_snapshot.jpg")]
+            full = os.path.join(CALIB_DIR, fn)
+            try:
+                mtime = os.path.getmtime(full)
+            except OSError:
+                continue
+            out[key] = {
+                "mtime": time.strftime("%Y-%m-%d %H:%M", time.localtime(mtime)),
+                "calibrated": os.path.exists(
+                    os.path.join(CALIB_DIR, key + "_H.npy")),
+            }
+    except OSError:
+        pass
+    return out
+
+
+HIST_LEN = int(HIST_HZ * 300)  # ~5 minutes of history
+LOG_LEN = 300                 # rolling /rosout lines kept
+LOG_LEVEL_NAME = {10: "DEBUG", 20: "INFO", 30: "WARN", 40: "ERROR", 50: "FATAL"}
+
+T_ESTOP = "/ethon/estop"
+T_ARM = "/ethon/hmi/arm"
+T_MODE = "/ethon/hmi/mode"
+T_MARK = "/ethon/lap/mark"
+T_RACE_START = "/ethon/race/start"
+LOG_DIR = "/home/jetson/ethon/logs"
+
+
+def _jsonable(o):
+    """Coerce a message_to_ordereddict tree into something json.dumps accepts."""
+    if isinstance(o, dict):
+        return {k: _jsonable(v) for k, v in o.items()}
+    if isinstance(o, (list, tuple)):
+        return [_jsonable(v) for v in o]
+    if isinstance(o, (bytes, bytearray, array.array)):
+        return list(o)
+    if o is None or isinstance(o, (bool, int, float, str)):
+        return o
+    return str(o)
+
+
+# ── ROS value <-> Python helpers (parameters) ───────────────────────────────
+_PT = ParameterType
+_TYPE_NAME = {
+    _PT.PARAMETER_NOT_SET: "unset", _PT.PARAMETER_BOOL: "bool",
+    _PT.PARAMETER_INTEGER: "int", _PT.PARAMETER_DOUBLE: "double",
+    _PT.PARAMETER_STRING: "string", _PT.PARAMETER_BYTE_ARRAY: "byte[]",
+    _PT.PARAMETER_BOOL_ARRAY: "bool[]", _PT.PARAMETER_INTEGER_ARRAY: "int[]",
+    _PT.PARAMETER_DOUBLE_ARRAY: "double[]", _PT.PARAMETER_STRING_ARRAY: "string[]",
+}
+
+
+def _pv_to_py(pv):
+    t = pv.type
+    if t == _PT.PARAMETER_BOOL:
+        return pv.bool_value
+    if t == _PT.PARAMETER_INTEGER:
+        return pv.integer_value
+    if t == _PT.PARAMETER_DOUBLE:
+        return pv.double_value
+    if t == _PT.PARAMETER_STRING:
+        return pv.string_value
+    if t == _PT.PARAMETER_BOOL_ARRAY:
+        return list(pv.bool_array_value)
+    if t == _PT.PARAMETER_INTEGER_ARRAY:
+        return list(pv.integer_array_value)
+    if t == _PT.PARAMETER_DOUBLE_ARRAY:
+        return list(pv.double_array_value)
+    if t == _PT.PARAMETER_STRING_ARRAY:
+        return list(pv.string_array_value)
+    if t == _PT.PARAMETER_BYTE_ARRAY:
+        return list(pv.byte_array_value)
+    return None
+
+
+def _py_to_pv(type_int, raw):
+    """Build a ParameterValue of the given type from the user's string input."""
+    pv = ParameterValue()
+    pv.type = type_int
+    s = str(raw).strip()
+    if type_int == _PT.PARAMETER_BOOL:
+        pv.bool_value = s.lower() in ("1", "true", "yes", "on")
+    elif type_int == _PT.PARAMETER_INTEGER:
+        pv.integer_value = int(float(s))
+    elif type_int == _PT.PARAMETER_DOUBLE:
+        pv.double_value = float(s)
+    elif type_int == _PT.PARAMETER_STRING:
+        pv.string_value = s
+    elif type_int == _PT.PARAMETER_INTEGER_ARRAY:
+        pv.integer_array_value = [int(x) for x in json.loads(s)]
+    elif type_int == _PT.PARAMETER_DOUBLE_ARRAY:
+        pv.double_array_value = [float(x) for x in json.loads(s)]
+    elif type_int == _PT.PARAMETER_BOOL_ARRAY:
+        pv.bool_array_value = [bool(x) for x in json.loads(s)]
+    elif type_int == _PT.PARAMETER_STRING_ARRAY:
+        pv.string_array_value = [str(x) for x in json.loads(s)]
+    else:
+        raise ValueError("unsupported parameter type %s" % type_int)
+    return pv
+
+
+class EthonDashboard(Node):
+    def __init__(self):
+        super().__init__("web_dashboard")
+        self._lock = threading.Lock()
+        self._topics = {}             # name -> {type, t, value, json}
+        self._subscribed = {}         # name -> type_str
+        self._cbg = ReentrantCallbackGroup()
+        self._param_clients = {}      # (node, srv) -> client
+        self._hist = deque(maxlen=HIST_LEN)   # time-series for charts + track
+        self._logs = deque(maxlen=LOG_LEN)    # rolling /rosout lines
+        self._log_seq = 0
+        self._cones = {"t": 0.0, "pts": []}   # latest /ethon/cones (base_link x,y)
+        self._path = {"t": 0.0, "pts": []}    # latest /ethon/path (base_link x,y)
+
+        latched = QoSProfile(
+            depth=1, history=HistoryPolicy.KEEP_LAST,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        self._estop_pub = self.create_publisher(Bool, T_ESTOP, latched)
+        self._arm_pub = self.create_publisher(Bool, T_ARM, 10)
+        self._mode_pub = self.create_publisher(String, T_MODE, 10)
+        self._mark_pub = self.create_publisher(Empty, T_MARK, 10)
+        self._race_pub = self.create_publisher(Empty, T_RACE_START, 10)
+        self._drivetest_pub = self.create_publisher(Float64, "/ethon/drive_test", 10)
+
+        # /rosout is captured into a dedicated log ring (not the topic grid)
+        self.create_subscription(
+            Log, "/rosout", self._on_rosout,
+            QoSProfile(depth=100, history=HistoryPolicy.KEEP_LAST,
+                       reliability=ReliabilityPolicy.BEST_EFFORT,
+                       durability=DurabilityPolicy.VOLATILE),
+            callback_group=self._cbg)
+
+        self.rescan()
+        self.create_timer(3.0, self.rescan)
+        self.create_timer(1.0 / HIST_HZ, self._sample)
+        self.get_logger().info("web_dashboard up -- serving on :%d/dashboard" % HTTP_PORT)
+
+    # ── topic discovery / caching ──────────────────────────────────────────
+    def _qos_for(self, name):
+        # latched topics need a RELIABLE + TRANSIENT_LOCAL reader to actually
+        # receive the last value on (re)connect -- a BEST_EFFORT reader does
+        # NOT get transient-local historical samples. /ethon/estop (health
+        # monitor) and /ethon/hmi/armed (planner's authoritative arm state).
+        if name in (T_ESTOP, "/ethon/hmi/armed"):
+            return QoSProfile(
+                depth=1, history=HistoryPolicy.KEEP_LAST,
+                reliability=ReliabilityPolicy.RELIABLE,
+                durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        return QoSProfile(
+            depth=10, history=HistoryPolicy.KEEP_LAST,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE)
+
+    def rescan(self):
+        """Subscribe to any topic we are not already watching."""
+        try:
+            names_types = self.get_topic_names_and_types()
+        except Exception:
+            return
+        for name, types in names_types:
+            if name in SKIP_TOPICS or name in self._subscribed or not types:
+                continue
+            type_str = types[0]
+            try:
+                msg_cls = get_message(type_str)
+            except Exception:
+                continue
+            self._subscribed[name] = type_str
+            self.create_subscription(
+                msg_cls, name,
+                lambda m, n=name, t=type_str: self._on_msg(n, t, m),
+                self._qos_for(name), callback_group=self._cbg)
+            self.get_logger().info("watching %s [%s]" % (name, type_str))
+
+    def _on_msg(self, name, type_str, msg):
+        try:
+            d = _jsonable(message_to_ordereddict(msg))
+        except Exception as exc:
+            d = {"_decode_error": str(exc)}
+        parsed = None
+        # String topics on this project carry JSON payloads -- decode for display
+        if isinstance(d, dict) and set(d.keys()) == {"data"} and isinstance(d["data"], str):
+            try:
+                parsed = json.loads(d["data"])
+            except (ValueError, TypeError):
+                parsed = None
+        value = self._summarise(type_str, parsed if parsed is not None else d)
+        now = time.monotonic()
+        with self._lock:
+            self._topics[name] = {"type": type_str, "t": now, "value": value}
+            if name == "/ethon/cones":
+                self._cones = {"t": now, "pts": self._extract_xy(d, False)}
+            elif name == "/ethon/path":
+                self._path = {"t": now, "pts": self._extract_xy(d, True)}
+
+    @staticmethod
+    def _extract_xy(d, nested):
+        """Pull [x, y] (base_link metres) from a PoseArray (nested=False) or a
+        Path (nested=True, where each entry wraps the pose under 'pose')."""
+        out = []
+        for p in (d.get("poses") or []):
+            pose = p.get("pose") if nested else p
+            pos = (pose or {}).get("position") or {}
+            x, y = pos.get("x"), pos.get("y")
+            if isinstance(x, (int, float)) and isinstance(y, (int, float)):
+                out.append([round(x, 2), round(y, 2)])
+        return out
+
+    @staticmethod
+    def _summarise(type_str, d):
+        """Trim huge geometry messages so /api/state stays light."""
+        if isinstance(d, dict) and "poses" in d and isinstance(d["poses"], list):
+            head = d.get("header", {})
+            return {"frame_id": head.get("frame_id"),
+                    "pose_count": len(d["poses"])}
+        return d
+
+    # ── /rosout log ring ───────────────────────────────────────────────────
+    def _on_rosout(self, m):
+        self._log_seq += 1
+        entry = {"i": self._log_seq, "lvl": int(m.level),
+                 "lvl_name": LOG_LEVEL_NAME.get(int(m.level), str(m.level)),
+                 "name": m.name, "msg": m.msg}
+        with self._lock:
+            self._logs.append(entry)
+
+    def logs(self, since=0):
+        with self._lock:
+            rows = [r for r in self._logs if r["i"] > since]
+        return {"logs": rows, "last": (rows[-1]["i"] if rows else since)}
+
+    # ── time-series history (charts + GPS track) ───────────────────────────
+    def _sample(self):
+        with self._lock:
+            drive = (self._topics.get("/ethon/drive_status") or {}).get("value")
+            gps = (self._topics.get("/gps/fix") or {}).get("value")
+        sp = en = wh = tp = lat = lon = None
+        if isinstance(drive, dict):
+            ws = drive.get("wheel_speed_ms")
+            if isinstance(ws, (int, float)):
+                sp = round(abs(ws) * 3.6, 2)
+            en = drive.get("energy_wh")
+            wh = drive.get("wh_per_km")
+            motors = drive.get("motors") or {}
+            temps = [v.get("temp_c") for v in motors.values()
+                     if isinstance(v, dict) and isinstance(v.get("temp_c"), (int, float))]
+            tp = max(temps) if temps else None
+        if isinstance(gps, dict):
+            la, lo = gps.get("latitude"), gps.get("longitude")
+            if (isinstance(la, (int, float)) and isinstance(lo, (int, float))
+                    and not (la == 0.0 and lo == 0.0)):
+                lat, lon = la, lo
+        with self._lock:
+            self._hist.append({"t": round(time.monotonic(), 2), "speed": sp,
+                               "energy": en, "whkm": wh, "temp": tp,
+                               "lat": lat, "lon": lon})
+
+    def history(self):
+        with self._lock:
+            h = list(self._hist)
+            lap = (self._topics.get("/ethon/lap") or {}).get("value")
+            cones = list(self._cones["pts"])
+            path = list(self._path["pts"])
+        line = None
+        if isinstance(lap, dict) and lap.get("line_lat") is not None:
+            line = {"lat": lap["line_lat"], "lon": lap["line_lon"],
+                    "r": lap.get("geofence_m") or 20.0}
+        base = {"cones": cones, "path": path, "line": line}
+        if not h:
+            base.update({"t": [], "speed": [], "energy": [], "whkm": [],
+                         "temp": [], "track": []})
+            return base
+        t0 = h[0]["t"]
+        base.update({
+            "t": [round(x["t"] - t0, 2) for x in h],
+            "speed": [x["speed"] for x in h],
+            "energy": [x["energy"] for x in h],
+            "whkm": [x["whkm"] for x in h],
+            "temp": [x["temp"] for x in h],
+            "track": [[x["lat"], x["lon"]] for x in h if x["lat"] is not None],
+        })
+        return base
+
+    # ── derived high-level status ──────────────────────────────────────────
+    def _status(self):
+        with self._lock:
+            snap = {n: v["value"] for n, v in self._topics.items()}
+        st = {"mode": None, "armed": None, "estop": None, "gps_fix": None,
+              "lat": None, "lon": None, "lap": None, "speed_kmh": None,
+              "line_set": None, "drive_enabled": None, "config_hold": None,
+              "estop_latched": None, "can_ok": None, "arm_requested": None,
+              "arm_block": None, "arm_ready": False, "battery_v": None}
+        drive = snap.get("/ethon/drive_status")
+        if isinstance(drive, dict):
+            # NOTE: drive "enabled" is /cmd_vel freshness, NOT arm state -- it
+            # stays true while disarmed (planner sends zero cmd_vel). Arm state
+            # comes from the planner's latched /ethon/hmi/armed below.
+            if isinstance(drive.get("enabled"), bool):
+                st["drive_enabled"] = drive["enabled"]
+            if drive.get("config_hold") is not None:
+                st["config_hold"] = bool(drive.get("config_hold"))
+            if drive.get("estop_latched") is not None:
+                st["estop_latched"] = bool(drive.get("estop_latched"))
+            ws = drive.get("wheel_speed_ms")
+            if isinstance(ws, (int, float)):
+                st["speed_kmh"] = round(abs(ws) * 3.6, 1)
+            sv = drive.get("supply_v")
+            if isinstance(sv, (int, float)):
+                st["battery_v"] = sv
+            motors = drive.get("motors") or {}
+            if motors:
+                avail = [v for v in motors.values() if isinstance(v, dict)
+                         and "unavailable" not in [str(f) for f in (v.get("faults") or [])]]
+                st["can_ok"] = len(avail) > 0
+        mode = snap.get("/ethon/hmi/mode")
+        if isinstance(mode, str):
+            st["mode"] = mode
+        arm = snap.get("/ethon/hmi/arm")
+        if isinstance(arm, dict) and "data" in arm:
+            st["arm_requested"] = bool(arm["data"])
+        # authoritative armed state from the planner (latched). Falls back to
+        # the last arm COMMAND if the planner hasn't published yet, else None.
+        armed = snap.get("/ethon/hmi/armed")
+        if isinstance(armed, dict) and "data" in armed:
+            st["armed"] = bool(armed["data"])
+        elif st["arm_requested"] is not None:
+            st["armed"] = st["arm_requested"]
+        estop = snap.get("/ethon/estop")
+        if isinstance(estop, dict) and "data" in estop:
+            st["estop"] = bool(estop["data"])
+        gps = snap.get("/gps/fix")
+        if isinstance(gps, dict):
+            status = (gps.get("status") or {}).get("status")
+            lat, lon = gps.get("latitude"), gps.get("longitude")
+            if isinstance(status, int):
+                st["gps_fix"] = (status >= 0 and not (lat == 0.0 and lon == 0.0))
+                st["lat"], st["lon"] = lat, lon
+        lap = snap.get("/ethon/lap")
+        if isinstance(lap, dict):
+            st["lap"] = lap.get("lap")
+            st["line_set"] = lap.get("line_set")
+            if st["gps_fix"] is None:
+                st["gps_fix"] = lap.get("fix")
+
+        # why won't it arm? — single human-readable reason for the UI
+        if st["drive_enabled"]:
+            reason = None
+        elif st["estop"] or st["estop_latched"]:
+            reason = "E-STOP latched — clear it (restarts ethon-stack)"
+        elif st["config_hold"]:
+            reason = "CONFIG HOLD — geometry_measured is false in vehicle.yaml"
+        elif st["can_ok"] is False:
+            reason = "no CAN — motors unavailable (check power / wiring)"
+        elif not st["arm_requested"]:
+            reason = "not armed — press ARM"
+        else:
+            reason = "armed — waiting for fresh /cmd_vel from planner"
+        st["arm_block"] = reason
+        st["arm_ready"] = reason is None
+        return st
+
+    def state(self):
+        now = time.monotonic()
+        with self._lock:
+            topics = {n: {"type": v["type"], "age_s": round(now - v["t"], 2),
+                          "value": v["value"]}
+                      for n, v in self._topics.items()}
+        live_nodes = set()
+        try:
+            live_nodes = {("/" + n.lstrip("/")) for n in self.get_node_names()}
+        except Exception:
+            pass
+        nodes = [n for n in PARAM_NODES if n in live_nodes]
+        return {"t": round(now, 2), "status": self._status(),
+                "topics": topics, "param_nodes": nodes}
+
+    # ── parameter services ─────────────────────────────────────────────────
+    def _param_client(self, node, srv_name, srv_type):
+        key = (node, srv_name)
+        cli = self._param_clients.get(key)
+        if cli is None:
+            cli = self.create_client(
+                srv_type, "%s/%s" % (node, srv_name), callback_group=self._cbg)
+            self._param_clients[key] = cli
+        return cli
+
+    def _call(self, cli, req, timeout=4.0):
+        if not cli.wait_for_service(timeout_sec=2.0):
+            return None
+        fut = cli.call_async(req)
+        done = threading.Event()
+        fut.add_done_callback(lambda _f: done.set())
+        if not done.wait(timeout):
+            return None
+        return fut.result()
+
+    def list_params(self, node):
+        lst = self._param_client(node, "list_parameters", ListParameters)
+        res = self._call(lst, ListParameters.Request())
+        if res is None:
+            return None
+        names = [n for n in res.result.names
+                 if n not in PARAM_NOISE
+                 and not n.startswith(PARAM_NOISE_PREFIX)]
+        names.sort()
+        if not names:
+            return []
+        get = self._param_client(node, "get_parameters", GetParameters)
+        gres = self._call(get, GetParameters.Request(names=names))
+        if gres is None:
+            return None
+        out = []
+        for name, pv in zip(names, gres.values):
+            out.append({"name": name, "type": int(pv.type),
+                        "type_name": _TYPE_NAME.get(pv.type, str(pv.type)),
+                        "value": _jsonable(_pv_to_py(pv))})
+        return out
+
+    def set_param(self, node, name, type_int, value):
+        try:
+            pv = _py_to_pv(int(type_int), value)
+        except Exception as exc:
+            return False, "bad value: %s" % exc
+        cli = self._param_client(node, "set_parameters", SetParameters)
+        res = self._call(cli, SetParameters.Request(
+            parameters=[Parameter(name=name, value=pv)]))
+        if res is None or not res.results:
+            return False, "no response from %s" % node
+        r = res.results[0]
+        return bool(r.successful), (r.reason or "")
+
+    # ── pre-race self-test ─────────────────────────────────────────────────
+    def selftest(self):
+        now = time.monotonic()
+        with self._lock:
+            ages = {n: now - v["t"] for n, v in self._topics.items()}
+            snap = {n: v["value"] for n, v in self._topics.items()}
+        checks = []
+
+        def chk(name, ok, detail=""):
+            checks.append({"name": name, "ok": bool(ok), "detail": detail})
+
+        for topic, limit, label in (
+                ("/ethon/drive_status", 3.0, "drive node publishing"),
+                ("/ethon/health", 3.0, "health monitor publishing"),
+                ("/ethon/cones", 3.0, "perception (cones) publishing"),
+                ("/ethon/lap", 2.0, "lap timer publishing"),
+                ("/gps/fix", 3.0, "GPS driver publishing"),
+                ("/ethon/strategy", 4.0, "race strategist publishing"),
+                ("/ethon/corridor", 2.0, "corridor warning publishing")):
+            age = ages.get(topic)
+            chk(label, age is not None and age < limit,
+                "no data yet" if age is None else "last msg %.1fs ago" % age)
+
+        gps = snap.get("/gps/fix") or {}
+        gst = (gps.get("status") or {}).get("status")
+        has_fix = (isinstance(gst, int) and gst >= 0
+                   and not (gps.get("latitude") == 0.0
+                            and gps.get("longitude") == 0.0))
+        _la, _lo = gps.get("latitude"), gps.get("longitude")
+        chk("GPS satellite fix", has_fix,
+            ("lat %.5f lon %.5f" % (_la, _lo)
+             if has_fix and isinstance(_la, (int, float))
+             and isinstance(_lo, (int, float))
+             else ("has fix" if has_fix else "no fix -- needs sky view")))
+
+        drive = snap.get("/ethon/drive_status") or {}
+        motors = drive.get("motors") or {}
+        avail = [k for k, v in motors.items() if isinstance(v, dict)
+                 and "unavailable" not in [str(f) for f in (v.get("faults") or [])]]
+        chk("CAN / motors reachable", bool(avail),
+            ("%d/%d motors" % (len(avail), len(motors))) if motors
+            else "no motor data")
+        chk("E-STOP clear", not drive.get("estop_latched")
+            and not (snap.get("/ethon/estop") or {}).get("data"),
+            "latched -- clear + restart stack"
+            if drive.get("estop_latched") else "clear")
+        chk("vehicle.yaml geometry measured", not drive.get("config_hold"),
+            "CONFIG HOLD -- fill vehicle.yaml, set geometry_measured true"
+            if drive.get("config_hold") else "ok")
+
+        chk("Pico wheel hub USB present", os.path.exists("/dev/ethon-wheel"),
+            "/dev/ethon-wheel")
+        try:
+            nodes = {"/" + n.lstrip("/") for n in self.get_node_names()}
+        except Exception:
+            nodes = set()
+        chk("wheel_bridge node alive", "/wheel_bridge" in nodes, "")
+        try:
+            free_gb = shutil.disk_usage("/home/jetson").free / 1e9
+            chk("disk space for logs", free_gb > 1.0, "%.1f GB free" % free_gb)
+        except OSError:
+            chk("disk space for logs", False, "statvfs failed")
+
+        ready = all(c["ok"] for c in checks)
+        return {"ready": ready, "checks": checks,
+                "verdict": "READY TO RACE" if ready else "NOT READY"}
+
+    # ── session logs (written by race_services SessionLogger) ─────────────
+    def list_sessions(self):
+        out = []
+        try:
+            for fn in sorted(os.listdir(LOG_DIR), reverse=True):
+                if not fn.endswith(".csv"):
+                    continue
+                st = os.stat(os.path.join(LOG_DIR, fn))
+                out.append({"name": fn, "kb": round(st.st_size / 1024.0, 1),
+                            "mtime": time.strftime(
+                                "%Y-%m-%d %H:%M",
+                                time.localtime(st.st_mtime))})
+        except OSError:
+            pass
+        return out
+
+    def read_session(self, fname):
+        if "/" in fname or "\\" in fname or ".." in fname \
+                or not fname.endswith(".csv"):
+            return None
+        path = os.path.join(LOG_DIR, fname)
+        try:
+            with open(path, newline="") as fh:
+                rows = list(csv.DictReader(fh))
+        except OSError:
+            return None
+
+        def _f(row, key):
+            v = row.get(key)
+            try:
+                return float(v) if v not in (None, "", "None") else None
+            except ValueError:
+                return None
+
+        # per-lap table from lap-counter increments
+        laps = []
+        prev_lap, prev_wh = None, None
+        for r in rows:
+            lap = _f(r, "lap")
+            wh = _f(r, "energy_wh")
+            if lap is None:
+                continue
+            if prev_lap is not None and lap > prev_lap:
+                laps.append({"lap": int(lap), "lap_s": _f(r, "last_s"),
+                             "wh": None if (wh is None or prev_wh is None)
+                             else round(wh - prev_wh, 1)})
+                prev_wh = wh
+            if prev_lap is None:
+                prev_wh = wh
+            prev_lap = lap
+
+        step = max(1, len(rows) // 2000)     # decimate for the browser
+        rows = rows[::step]
+        t0 = _f(rows[0], "t") if rows else 0.0
+        return {
+            "name": fname, "n": len(rows), "laps": laps,
+            "t": [round((_f(r, "t") or t0) - t0, 1) for r in rows],
+            "speed": [_f(r, "speed_ms") for r in rows],
+            "energy": [_f(r, "energy_wh") for r in rows],
+            "temp": [_f(r, "temp_c") for r in rows],
+            "track": [[_f(r, "lat"), _f(r, "lon")] for r in rows
+                      if _f(r, "lat") is not None],
+        }
+
+    # ── bench test: direct duty-cycle command to the drive motors ──────────
+    def drive_test(self, duty):
+        """Publish a duty-cycle (-1..1) to /ethon/drive_test. ethon_drive caps
+        it to test_max_duty and stops the motors if this stops being re-posted
+        (watchdog). The dashboard posts continuously while the test is on."""
+        try:
+            d = max(-1.0, min(1.0, float(duty)))
+        except (TypeError, ValueError):
+            return False, "bad duty"
+        self._drivetest_pub.publish(Float64(data=d))
+        return True, ""
+
+    # ── actions (mirror wheel_bridge) ──────────────────────────────────────
+    def action(self, what, arg=None):
+        if what == "arm":
+            self._arm_pub.publish(Bool(data=True))
+        elif what == "disarm":
+            self._arm_pub.publish(Bool(data=False))
+        elif what == "estop":
+            self._estop_pub.publish(Bool(data=True))
+            self.get_logger().error("dashboard E-STOP -> /ethon/estop true")
+        elif what == "clear_estop":
+            # drive latches estop until restart -> publish false then bounce
+            # ethon-stack (same mechanism as the wheel ARM+DISARM gesture).
+            self._estop_pub.publish(Bool(data=False))
+            try:
+                subprocess.Popen(["sudo", "-n", CLEAR_ESTOP_SCRIPT],
+                                 stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL)
+            except OSError as exc:
+                return False, "clear exec failed: %s" % exc
+            self.get_logger().warning("dashboard CLEAR E-STOP -> restart ethon-stack")
+        elif what == "mark":
+            self._mark_pub.publish(Empty())
+        elif what == "race_start":
+            self._race_pub.publish(Empty())
+            self.get_logger().warning("dashboard RACE START -> race clock running")
+        elif what == "mode":
+            target = arg if arg in ("capture", "autonomy") else None
+            if target is None:
+                return False, "mode must be capture|autonomy"
+            self._mode_pub.publish(String(data=target))
+            try:
+                subprocess.Popen(["sudo", "-n", MODE_SCRIPT, target],
+                                 stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL)
+            except OSError as exc:
+                return False, "mode exec failed: %s" % exc
+        else:
+            return False, "unknown action %s" % what
+        return True, ""
+
+
+# ── HTTP layer ───────────────────────────────────────────────────────────────
+PAGE = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ethon Dashboard</title>
+<style>
+:root{--bg:#0d1117;--card:#161b22;--edge:#30363d;--fg:#e6edf3;--mut:#8b949e;
+--grn:#3fb950;--red:#f85149;--amb:#d29922;--blu:#58a6ff;--cy:#39c5cf;}
+*{box-sizing:border-box}
+body{margin:0;font:14px/1.4 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+background:var(--bg);color:var(--fg)}
+header{display:flex;align-items:center;gap:12px 16px;flex-wrap:wrap;padding:9px 16px;
+border-bottom:1px solid var(--edge);position:sticky;top:0;background:rgba(13,17,23,.92);
+backdrop-filter:blur(6px);z-index:5}
+header h1{font-size:16px;margin:0;letter-spacing:.5px}
+#conn{color:var(--mut);font-size:12px}
+.dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:5px;
+vertical-align:middle;background:var(--mut)}
+.hdrstat{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-left:auto}
+.pill{font-size:11px;font-weight:700;padding:3px 10px;border-radius:20px;
+border:1px solid var(--edge);letter-spacing:.4px;white-space:nowrap;color:var(--mut)}
+.pill.on{background:rgba(63,185,80,.14);border-color:var(--grn);color:var(--grn)}
+.pill.bad{background:var(--red);border-color:var(--red);color:#fff}
+.pill.warn{background:rgba(210,153,34,.14);border-color:var(--amb);color:var(--amb)}
+.pill.info{border-color:var(--edge);color:var(--fg)}
+main{padding:16px;max-width:1200px;margin:0 auto}
+.cards{display:flex;flex-wrap:wrap;gap:10px;margin-bottom:18px}
+.stat{background:var(--card);border:1px solid var(--edge);border-radius:8px;
+padding:10px 14px;min-width:120px;flex:1}
+.stat .k{color:var(--mut);font-size:11px;text-transform:uppercase;letter-spacing:.5px}
+.stat .v{font-size:20px;font-weight:600;margin-top:3px}
+h2{font-size:13px;text-transform:uppercase;letter-spacing:1px;color:var(--mut);
+border-bottom:1px solid var(--edge);padding-bottom:6px;margin:22px 0 12px}
+details.sec{margin:22px 0 12px}
+details.sec>summary{font-size:13px;text-transform:uppercase;letter-spacing:1px;
+color:var(--mut);border-bottom:1px solid var(--edge);padding-bottom:6px;cursor:pointer;
+list-style:none;user-select:none}
+details.sec>summary::before{content:"\25B8  ";color:var(--mut)}
+details.sec[open]>summary::before{content:"\25BE  "}
+details.sec>summary::-webkit-details-marker{display:none}
+details.sec>*:not(summary){margin-top:12px}
+.btns{display:flex;flex-wrap:wrap;gap:8px}
+button{font:inherit;cursor:pointer;border:1px solid var(--edge);background:var(--card);
+color:var(--fg);border-radius:6px;padding:9px 16px;transition:border-color .12s,background .12s}
+button:hover{border-color:var(--blu)}
+button:active{background:#1c2330}
+button.g{border-color:var(--grn);color:var(--grn)}
+button.r{border-color:var(--red);color:var(--red)}
+button.a{border-color:var(--amb);color:var(--amb)}
+button.estop{background:var(--red);color:#fff;border-color:var(--red);font-weight:700}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:10px}
+.topic{background:var(--card);border:1px solid var(--edge);border-radius:8px;padding:10px 12px;overflow:hidden}
+.topic .th{display:flex;justify-content:space-between;align-items:baseline;gap:8px}
+.topic .tn{color:var(--blu);font-weight:600;word-break:break-all}
+.topic .ty{color:var(--mut);font-size:11px}
+.topic .age{font-size:11px;color:var(--mut)}
+.topic.stale .age{color:var(--amb)}
+pre{margin:8px 0 0;white-space:pre-wrap;word-break:break-word;font-size:12px;color:#c9d1d9;max-height:220px;overflow:auto}
+select{font:inherit;background:var(--card);color:var(--fg);border:1px solid var(--edge);border-radius:6px;padding:7px 10px}
+table{width:100%;border-collapse:collapse;margin-top:10px}
+td,th{text-align:left;padding:6px 8px;border-bottom:1px solid var(--edge);vertical-align:middle}
+th{color:var(--mut);font-size:11px;text-transform:uppercase}
+td .pt{color:var(--mut);font-size:11px}
+input.pv{font:inherit;background:#0d1117;color:var(--fg);border:1px solid var(--edge);
+border-radius:5px;padding:5px 8px;width:140px}
+.ok{color:var(--grn)} .bad{color:var(--red)}
+.muted{color:var(--mut)}
+#toast{position:fixed;bottom:16px;right:16px;background:var(--card);border:1px solid var(--edge);
+border-radius:8px;padding:10px 14px;opacity:0;transition:opacity .2s;pointer-events:none;max-width:340px}
+#toast.show{opacity:1}
+.armbar{padding:10px 14px;border-radius:8px;margin-bottom:14px;border-left:5px solid var(--mut);
+background:var(--card);font-weight:600}
+.armbar.ok{border-color:var(--grn);color:var(--grn)}
+.armbar.warn{border-color:var(--amb);color:var(--amb)}
+.armbar.bad{border-color:var(--red);color:var(--red)}
+.panel{background:var(--card);border:1px solid var(--edge);border-radius:8px;padding:8px}
+#map{width:100%;height:320px;display:block}
+#bird{width:100%;height:340px;display:block}
+.charts{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:10px}
+.chart{background:var(--card);border:1px solid var(--edge);border-radius:8px;padding:4px}
+.chart canvas{width:100%;height:150px;display:block}
+.camstat{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px}
+.srcchip{display:flex;align-items:center;gap:6px;font-size:11px;
+  background:var(--card);border:1px solid var(--edge);border-radius:6px;
+  padding:3px 8px}
+.srcchip .nm{font-weight:600}
+.srcchip .dot2{width:7px;height:7px;border-radius:50%;display:inline-block}
+/* Three columns so the tiles sit the way the cameras actually sit on the car:
+   left | wide | right across the top, and narrow directly beneath wide
+   (both front-biased cameras stacked in the middle column). Names changed
+   2026-08-11 when camera roles were redistributed across both boards
+   (old side_left/front_wide/side_right/front_far -> left/wide/right/narrow);
+   the grid position each name maps to is unchanged.
+   A source that is down simply leaves its cell empty, which is useful -- the
+   gap shows you which camera is missing rather than silently reflowing. */
+.camwrap{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
+@media (max-width:900px){ /* stack on narrow screens rather than squashing */
+  .camwrap{grid-template-columns:1fr}
+  .camcell{grid-column:auto !important;grid-row:auto !important}
+}
+.camcell{position:relative;background:#0d1117;border:1px solid var(--edge);
+  border-radius:8px;overflow:hidden}
+.camcell img{width:100%;display:block}
+.camcell .camlbl{position:absolute;top:6px;left:8px;font-size:11px;
+  background:rgba(0,0,0,.55);padding:2px 6px;border-radius:4px}
+.steerwrap{display:flex;gap:14px;align-items:center;flex-wrap:wrap}
+.steerwrap canvas{width:400px;height:210px;flex:0 0 auto;max-width:100%}
+.steerinfo{flex:1 1 200px;min-width:190px;font-size:13px}
+.steerrow{display:flex;justify-content:space-between;padding:3px 0;
+  border-bottom:1px solid var(--edge)}
+.logbar{display:flex;gap:10px;align-items:center;margin-bottom:8px;color:var(--mut);font-size:12px}
+.log{height:240px;overflow:auto;background:#0d1117;border:1px solid var(--edge);border-radius:8px;padding:8px;font-size:12px}
+.log .lg{padding:1px 0;white-space:pre-wrap;word-break:break-word}
+.log .l30{color:var(--amb)} .log .l40{color:var(--red)} .log .l50{color:#fff;background:#5a1111}
+.log .l10{color:var(--mut)}
+</style>
+</head>
+<body>
+<header>
+  <h1>ETHON&nbsp;//&nbsp;DEBUG</h1>
+  <nav style="display:flex;gap:12px;font-size:12px">
+    <a href="/dashboard" style="color:var(--blu)">DASH</a>
+    <a href="/pit" style="color:var(--mut)">PIT</a>
+    <a href="/replay" style="color:var(--mut)">REPLAY</a>
+    <a href="/calib" style="color:var(--mut)">CALIB</a>
+  </nav>
+  <div id="hdrstat" class="hdrstat"></div>
+  <span id="conn"><span class="dot" id="dot"></span><span id="conntxt">connecting…</span></span>
+</header>
+<main>
+  <div id="armbar" class="armbar">checking drive…</div>
+  <div class="cards" id="cards"></div>
+
+  <h2>Actions</h2>
+  <div class="btns">
+    <button class="g" onclick="act('arm')">ARM</button>
+    <button onclick="act('disarm')">DISARM</button>
+    <button class="estop" onclick="act('estop')">E-STOP</button>
+    <button class="a" onclick="act('clear_estop')">CLEAR E-STOP</button>
+    <button class="g" onclick="act('mark')">MARK LINE</button>
+    <button onclick="act('mode','autonomy')">MODE: AUTONOMY</button>
+    <button onclick="act('mode','capture')">MODE: CAPTURE</button>
+    <button class="g" onclick="if(confirm('Start the 70-min race clock?'))act('race_start')">START RACE</button>
+    <button class="a" onclick="selftest()">SELF-TEST</button>
+  </div>
+  <div id="selftest" style="margin-top:10px"></div>
+
+  <h2>Motor bench test <span class="muted">wheels OFF the ground</span></h2>
+  <div class="panel" style="padding:12px">
+    <div class="armbar warn" style="margin-bottom:10px">
+      &#9888; Spins the drive Krakens directly (open-loop duty, bypasses the
+      planner). Rear wheels MUST be off the ground. Release / STOP and the
+      motors coast within half a second.
+    </div>
+    <div class="btns" style="align-items:center;margin-bottom:8px">
+      <span class="muted">Control mode:</span>
+      <button id="mode-duty" onclick="setFoc(false)">DUTY (no license)</button>
+      <button id="mode-foc" onclick="setFoc(true)">FOC (needs Pro)</button>
+      <span id="modestate" class="muted"></span>
+    </div>
+    <div class="btns" style="align-items:center;margin-bottom:8px">
+      <span class="muted">Duty</span>
+      <input id="dutyslider" type="range" min="0" max="30" value="10" step="1"
+             oninput="document.getElementById('dutyval').textContent=this.value+'%'"
+             style="width:220px">
+      <span id="dutyval" style="min-width:44px;display:inline-block">10%</span>
+      <label class="muted"><input type="radio" name="dir" id="dir-fwd" checked> fwd</label>
+      <label class="muted"><input type="radio" name="dir" id="dir-rev"> rev</label>
+    </div>
+    <div class="btns">
+      <button class="g" id="test-start" onclick="startTest()">START TEST</button>
+      <button class="estop" id="test-stop" onclick="stopTest()">STOP</button>
+      <span id="teststate" class="muted"></span>
+    </div>
+    <div id="testreadout" class="muted" style="margin-top:8px;font-size:12px"></div>
+  </div>
+
+  <h2>Track map <span class="muted">GPS / world</span></h2>
+  <div class="panel"><canvas id="map"></canvas></div>
+
+  <h2>Cones &amp; plan <span class="muted">robot frame, forward = up</span></h2>
+  <h2>Cameras <span class="muted" style="font-size:12px">what the model sees</span></h2>
+  <div class="panel">
+    <div id="camstat" class="camstat"></div>
+    <div id="camwrap" class="camwrap"></div>
+    <div id="camnone" class="muted" style="font-size:12px">
+      no source is delivering frames yet — a preview appears here as soon as
+      one does.</div>
+  </div>
+
+  <div class="panel"><canvas id="bird"></canvas></div>
+
+  <h2>Telemetry</h2>
+  <div class="charts">
+    <div class="chart"><canvas id="c_speed"></canvas></div>
+    <div class="chart"><canvas id="c_energy"></canvas></div>
+    <div class="chart"><canvas id="c_whkm"></canvas></div>
+    <div class="chart"><canvas id="c_temp"></canvas></div>
+  </div>
+
+  <h2>Steering</h2>
+  <div class="panel">
+    <div class="steerwrap">
+      <canvas id="steerviz"></canvas>
+      <div class="steerinfo">
+        <div class="steerrow"><span class="muted">state</span>
+          <b id="sv_state">—</b></div>
+        <div class="steerrow"><span class="muted">road wheel</span>
+          <b id="sv_deg">—</b></div>
+        <div class="steerrow"><span class="muted">column</span>
+          <b id="sv_col">—</b></div>
+        <div class="steerrow"><span class="muted">lock (measured)</span>
+          <b id="sv_lim">—</b></div>
+        <div class="steerrow"><span class="muted">travel used</span>
+          <b id="sv_pct">—</b></div>
+        <div class="steerrow"><span class="muted">control</span>
+          <b id="sv_mode">—</b></div>
+        <div class="steerrow"><span class="muted">motor</span>
+          <b id="sv_mot">—</b></div>
+      </div>
+    </div>
+  </div>
+
+  <h2>Parameters &mdash; edit live</h2>
+  <div class="btns" style="margin-bottom:6px">
+    <select id="pnode" onchange="loadParams()"><option value="">— pick a node —</option></select>
+    <button onclick="loadParams()">↻ reload</button>
+  </div>
+  <div id="params" class="muted">Pick a node to view and edit its parameters.</div>
+
+  <details class="sec">
+    <summary>Log <span class="muted">/rosout</span></summary>
+    <div class="logbar">
+      <label><input type="checkbox" id="logpause"> pause</label>
+      <span>level</span>
+      <select id="loglevel" onchange="renderLog()">
+        <option value="0">ALL</option><option value="10">DEBUG+</option>
+        <option value="20" selected>INFO+</option><option value="30">WARN+</option>
+        <option value="40">ERROR+</option>
+      </select>
+      <button onclick="clearLog()">clear</button>
+    </div>
+    <pre id="log" class="log"></pre>
+  </details>
+
+  <details class="sec">
+    <summary>Topics <span class="muted">live &mdash; all ROS topics</span></summary>
+    <div class="grid" id="topics"></div>
+  </details>
+</main>
+<div id="toast"></div>
+
+<script>
+let lastNodes = "";
+let lastHist = null;    // last /api/history payload (cones + path)
+let lastDrive = {};     // last /ethon/drive_status value
+function el(t,c,txt){const e=document.createElement(t);if(c)e.className=c;if(txt!=null)e.textContent=txt;return e;}
+function toast(msg,bad){const t=document.getElementById('toast');t.textContent=msg;
+  t.className=bad?'show bad':'show';setTimeout(()=>t.className='',2600);}
+
+function fmtHeader(s){
+  const box=document.getElementById('hdrstat');if(!box)return;box.innerHTML='';
+  const pill=(t,c)=>{box.appendChild(el('span','pill'+(c?' '+c:''),t));};
+  if(s.estop){pill('E-STOP','bad');}
+  else pill(s.armed===true?'ARMED':(s.armed===false?'DISARMED':'ARM ?'),s.armed?'on':'');
+  pill('GPS '+(s.gps_fix===true?'OK':(s.gps_fix===false?'NO FIX':'?')),
+       s.gps_fix===true?'on':(s.gps_fix===false?'warn':''));
+  if(s.battery_v!=null)pill(s.battery_v.toFixed(1)+' V',
+       s.battery_v<10.5?'bad':(s.battery_v<11.5?'warn':'on'));
+  if(s.speed_kmh!=null)pill(s.speed_kmh+' km/h','info');
+}
+
+function fmtStat(s){
+  const cards=[
+    ['State', s.estop?'E-STOP':(s.armed===true?'ARMED':(s.armed===false?'DISARMED':'—')),
+       s.estop?'var(--red)':(s.armed?'var(--grn)':'var(--mut)')],
+    ['Mode', s.mode?s.mode.toUpperCase():'—', 'var(--fg)'],
+    ['GPS', s.gps_fix===true?'FIX':(s.gps_fix===false?'NO FIX':'—'),
+       s.gps_fix?'var(--grn)':'var(--red)'],
+    ['Lap', s.lap==null?'—':s.lap, 'var(--fg)'],
+    ['Speed', s.speed_kmh==null?'—':s.speed_kmh+' km/h', 'var(--fg)'],
+    ['Line', s.line_set===true?'set':(s.line_set===false?'unset':'—'),
+       s.line_set?'var(--grn)':'var(--mut)'],
+    ['Battery', s.battery_v==null?'—':s.battery_v.toFixed(1)+' V',
+       s.battery_v==null?'var(--mut)':(s.battery_v<10.5?'var(--red)':(s.battery_v<11.5?'var(--amb)':'var(--grn)'))],
+  ];
+  const box=document.getElementById('cards');box.innerHTML='';
+  for(const [k,v,col] of cards){
+    const c=el('div','stat');c.appendChild(el('div','k',k));
+    const ve=el('div','v',v);ve.style.color=col;c.appendChild(ve);box.appendChild(c);
+  }
+}
+
+function fmtTopics(topics){
+  const box=document.getElementById('topics');
+  const names=Object.keys(topics).sort();
+  box.innerHTML='';
+  for(const n of names){
+    const t=topics[n];const card=el('div','topic'+(t.age_s>3?' stale':''));
+    const th=el('div','th');th.appendChild(el('span','tn',n));
+    th.appendChild(el('span','age',t.age_s+'s'));card.appendChild(th);
+    card.appendChild(el('div','ty',t.type));
+    card.appendChild(el('pre',null,JSON.stringify(t.value,null,1)));
+    box.appendChild(card);
+  }
+}
+
+async function tick(){
+  try{
+    const r=await fetch('/api/state',{cache:'no-store'});const s=await r.json();
+    document.getElementById('dot').style.background='var(--grn)';
+    document.getElementById('conntxt').textContent='live';
+    fmtHeader(s.status);fmtStat(s.status);fmtArm(s.status);fmtTopics(s.topics);
+    const dst=(s.topics['/ethon/drive_status']||{}).value||{};
+    updateTestPanel(s.status,dst);
+    drawSteer(dst);
+    // Redraw the bird's-eye here too (not just on the slow history tick) so
+    // the predicted-trajectory arc tracks the wheel without lagging a second
+    // behind. Cones/path come from the cached history payload.
+    lastDrive=dst;
+    if(lastHist) drawBird('bird',lastHist.cones,lastHist.path,dst);
+    updateCamStatus((s.topics['/ethon/fusion_status']||{}).value||{});
+    const nodes=s.param_nodes.join(',');
+    if(nodes!==lastNodes){lastNodes=nodes;const sel=document.getElementById('pnode');
+      const cur=sel.value;sel.innerHTML='<option value="">— pick a node —</option>';
+      for(const n of s.param_nodes){const o=el('option',null,n);o.value=n;sel.appendChild(o);}
+      sel.value=cur;}
+  }catch(e){
+    document.getElementById('dot').style.background='var(--red)';
+    document.getElementById('conntxt').textContent='disconnected';
+  }
+}
+
+async function act(what,arg){
+  try{
+    const r=await fetch('/api/action',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({action:what,arg:arg})});
+    const j=await r.json();
+    toast(j.ok?('✓ '+what+(arg?' '+arg:'')):('✗ '+(j.reason||what)),!j.ok);
+  }catch(e){toast('✗ '+what+' failed',true);}
+}
+
+async function loadParams(){
+  const node=document.getElementById('pnode').value;
+  const box=document.getElementById('params');
+  if(!node){box.className='muted';box.textContent='Pick a node to view and edit its parameters.';return;}
+  box.className='';box.textContent='loading…';
+  try{
+    const r=await fetch('/api/params?node='+encodeURIComponent(node),{cache:'no-store'});
+    const j=await r.json();
+    if(!j.ok){box.textContent='error: '+(j.reason||'unreachable');return;}
+    if(!j.params.length){box.className='muted';box.textContent='(no tunable parameters)';return;}
+    const tbl=el('table');const hdr=el('tr');
+    for(const h of ['Parameter','Type','Value','']){hdr.appendChild(el('th',null,h));}
+    tbl.appendChild(hdr);
+    for(const p of j.params){
+      const tr=el('tr');
+      tr.appendChild(el('td',null,p.name));
+      tr.appendChild(el('td','pt',p.type_name));
+      const tdv=el('td');const inp=el('input','pv');inp.value=JSON.stringify(p.value).replace(/^"|"$/g,'');
+      inp.dataset.type=p.type;inp.dataset.name=p.name;tdv.appendChild(inp);tr.appendChild(tdv);
+      const tdb=el('td');const b=el('button',null,'Set');
+      b.onclick=()=>setParam(node,p.name,p.type,inp.value,b);tdb.appendChild(b);tr.appendChild(tdb);
+      tbl.appendChild(tr);
+    }
+    box.innerHTML='';box.appendChild(tbl);
+  }catch(e){box.textContent='request failed';}
+}
+
+async function setParam(node,name,type,value,btn){
+  btn.disabled=true;btn.textContent='…';
+  try{
+    const r=await fetch('/api/param',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({node:node,name:name,type:type,value:value})});
+    const j=await r.json();
+    toast(j.ok?('✓ '+name+' = '+value):('✗ '+name+': '+(j.reason||'rejected')),!j.ok);
+  }catch(e){toast('✗ '+name+' failed',true);}
+  btn.disabled=false;btn.textContent='Set';
+}
+
+function fmtArm(s){
+  const b=document.getElementById('armbar');
+  if(s.arm_ready){b.className='armbar ok';b.textContent='✓ DRIVE ENABLED — motors live';return;}
+  const sev=(s.estop||s.estop_latched)?'bad':'warn';
+  b.className='armbar '+sev;b.textContent='⚠ ARM BLOCKED: '+(s.arm_block||'unknown');
+}
+
+function setupCanvas(id){
+  const cv=document.getElementById(id);if(!cv)return null;
+  const dpr=window.devicePixelRatio||1;
+  const w=cv.clientWidth||300,h=cv.clientHeight||150;
+  cv.width=Math.round(w*dpr);cv.height=Math.round(h*dpr);
+  const ctx=cv.getContext('2d');ctx.setTransform(dpr,0,0,dpr,0,0);
+  return {ctx:ctx,w:w,h:h};
+}
+
+// ── steering visualiser ───────────────────────────────────────────────────
+// Left: the steering wheel as the driver sees it (column rotation, so it can
+// exceed 360 deg). Right: the road wheels from above. The arc shows the
+// measured lock-to-lock travel; it turns amber near the stops.
+function drawSteer(d){
+  const s=setupCanvas('steerviz');if(!s)return;
+  const ctx=s.ctx,w=s.w,h=s.h;
+  ctx.clearRect(0,0,w,h);ctx.fillStyle='#161b22';ctx.fillRect(0,0,w,h);
+  // Rendering sign. Reported position is positive in the direction the motor
+  // calls forward, which on this car is physically COUNTER-clockwise while
+  // canvas rotate() is positive clockwise — so the raw value renders mirrored.
+  // Follow steer_inverted instead of hardcoding, so flipping that config keeps
+  // the picture matching the real wheel.
+  const dsign=(d.steer_inverted===true)?1:-1;
+  const col=(d.steer_col_rot==null)?null:dsign*(+d.steer_col_rot);
+  const deg=(d.road_wheel_deg==null)?null:dsign*(+d.road_wheel_deg);
+  const lim=(d.steer_limit_col_rot==null)?null:Math.abs(+d.steer_limit_col_rot);
+  const homed=!!d.steer_homed, dead=(col==null);
+  const frac=(col!=null&&lim)?Math.max(-1,Math.min(1,col/lim)):0;
+  const near=Math.abs(frac)>0.9;
+  const live=homed&&!dead;
+  const accent=dead?'#6e7681':(near?'#d29922':(live?'#3fb950':'#6e7681'));
+
+  // ── steering wheel (left) — formula style, matching the real wheel ──
+  const cx=w*0.30,cy=h*0.52,R=Math.min(w*0.155,h*0.40);
+  const rr=(x,y,ww,hh,r)=>{ctx.beginPath();
+    ctx.moveTo(x+r,y);ctx.arcTo(x+ww,y,x+ww,y+hh,r);
+    ctx.arcTo(x+ww,y+hh,x,y+hh,r);ctx.arcTo(x,y+hh,x,y,r);
+    ctx.arcTo(x,y,x+ww,y,r);ctx.closePath();};
+  // travel arc sits behind the wheel: -lim..+lim over the top
+  if(lim){
+    const ar=R*1.42;
+    ctx.lineWidth=4;ctx.strokeStyle='#21262d';
+    ctx.beginPath();ctx.arc(cx,cy,ar,Math.PI*0.78,Math.PI*2.22);ctx.stroke();
+    const a0=Math.PI*1.5,aN=a0+frac*(Math.PI*0.72);
+    ctx.strokeStyle=accent;ctx.beginPath();
+    ctx.arc(cx,cy,ar,Math.min(a0,aN),Math.max(a0,aN));ctx.stroke();
+  }
+  const rot=(col==null)?0:col*Math.PI*2;   // column rotations -> radians
+  ctx.save();ctx.translate(cx,cy);ctx.rotate(rot);
+  const carbon='#22272e',edge=dead?'#444c56':accent;
+  ctx.lineWidth=1.5;ctx.strokeStyle=edge;ctx.fillStyle=carbon;
+  // grips (angled, lower left/right)
+  for(const sx of [-1,1]){
+    ctx.save();ctx.translate(sx*R*0.92,R*0.34);ctx.rotate(sx*0.20);
+    rr(-R*0.20,-R*0.30,R*0.40,R*1.02,R*0.16);ctx.fill();ctx.stroke();
+    ctx.restore();
+  }
+  // upper wings (button pods) + top bar, drawn as one open-top body
+  for(const sx of [-1,1]){
+    ctx.save();ctx.scale(sx,1);
+    rr(R*0.30,-R*0.80,R*0.98,R*0.92,R*0.14);ctx.fill();ctx.stroke();
+    ctx.restore();
+  }
+  rr(-R*0.62,-R*0.80,R*1.24,R*0.30,R*0.08);ctx.fill();ctx.stroke();  // LED bar
+  rr(-R*0.66,-R*0.50,R*1.32,R*0.86,R*0.10);ctx.fill();ctx.stroke();  // centre
+  rr(-R*0.52,R*0.36,R*1.04,R*0.40,R*0.12);ctx.fill();ctx.stroke();   // lower
+  // rev / shift LEDs across the top bar (same map as the Nextion HMI)
+  const kmh=Math.abs(+(d.wheel_speed_ms||0))*3.6, sf=Math.min(1,kmh/50);
+  for(let i=0;i<15;i++){
+    const on=live&&(i/15)<sf;
+    ctx.fillStyle=on?(i<9?'#3fb950':(i<12?'#d29922':'#f85149')):'#161b22';
+    ctx.beginPath();
+    ctx.arc(-R*0.55+i*(R*1.10/14),-R*0.65,R*0.045,0,Math.PI*2);ctx.fill();
+  }
+  // centre screen
+  ctx.fillStyle='#0d1117';ctx.strokeStyle='#30363d';
+  rr(-R*0.46,-R*0.40,R*0.92,R*0.64,R*0.05);ctx.fill();ctx.stroke();
+  ctx.fillStyle=dead?'#6e7681':'#e6edf3';
+  ctx.font='bold '+Math.round(R*0.34)+'px system-ui';
+  ctx.textAlign='center';ctx.textBaseline='middle';
+  ctx.fillText(dead?'--':kmh.toFixed(0),0,-R*0.16);
+  ctx.font=Math.round(R*0.16)+'px system-ui';ctx.fillStyle='#8b949e';
+  ctx.fillText('km/h',0,R*0.10);
+  // button pods: a few coloured buttons per side, like the real wheel
+  const pods=[[-0.95,-0.62,'#d29922'],[-0.62,-0.60,'#f85149'],
+              [-0.95,-0.30,'#f85149'],[-0.60,-0.26,'#8b949e'],
+              [ 0.95,-0.62,'#388bfd'],[ 0.62,-0.60,'#3fb950'],
+              [ 0.95,-0.30,'#3fb950'],[ 0.60,-0.26,'#8b949e']];
+  for(const [px,py,c] of pods){
+    ctx.fillStyle=live?c:'#30363d';
+    ctx.beginPath();ctx.arc(px*R,py*R,R*0.075,0,Math.PI*2);ctx.fill();
+  }
+  // centre hub + straight-ahead marker
+  ctx.fillStyle='#30363d';ctx.beginPath();
+  ctx.arc(0,R*0.56,R*0.10,0,Math.PI*2);ctx.fill();
+  ctx.fillStyle=edge;ctx.beginPath();
+  ctx.arc(0,-R*0.86,R*0.05,0,Math.PI*2);ctx.fill();
+  ctx.textBaseline='alphabetic';
+  ctx.restore();
+
+  // ── road wheels from above (right) ──
+  const bx=w*0.68,by=h*0.5,L=Math.min(w*0.12,h*0.30);
+  ctx.strokeStyle='#30363d';ctx.lineWidth=2;
+  ctx.beginPath();ctx.moveTo(bx,by-L*1.15);ctx.lineTo(bx,by+L*1.15);ctx.stroke();
+  ctx.beginPath();ctx.moveTo(bx-L*0.85,by-L*1.15);   // front axle
+  ctx.lineTo(bx+L*0.85,by-L*1.15);ctx.stroke();
+  const wr=(deg==null)?0:(-deg*Math.PI/180);  // +deg = right = clockwise
+  for(const sx of [-1,1]){
+    const px=bx+sx*L*0.85, py=by-L*1.15;
+    ctx.save();ctx.translate(px,py);ctx.rotate(wr);
+    ctx.fillStyle=accent;ctx.fillRect(-2.5,-L*0.42,5,L*0.84);ctx.restore();
+  }
+  for(const sx of [-1,1]){                     // rear wheels, fixed
+    ctx.fillStyle='#30363d';
+    ctx.fillRect(bx+sx*L*0.85-2.5,by+L*1.15-L*0.42,5,L*0.84);
+  }
+  ctx.fillStyle='#6e7681';ctx.font='10px system-ui';ctx.textAlign='center';
+  ctx.fillText('front',bx,by-L*1.6);
+
+  if(dead){ctx.fillStyle='#6e7681';ctx.font='12px system-ui';
+    ctx.textAlign='center';ctx.fillText('no steering data',w/2,h-8);}
+
+  const S=(id,v)=>{const e=document.getElementById(id);if(e)e.textContent=v;};
+  S('sv_state', dead?'no data':(d.steering||(homed?'homed':'—')));
+  S('sv_deg', deg==null?'—':(deg>0?'+':'')+deg.toFixed(1)+'°');
+  S('sv_col', col==null?'—':(col>0?'+':'')+col.toFixed(3)+' rot');
+  S('sv_lim', lim?('±'+lim.toFixed(3)+' rot ('
+    +(lim*360).toFixed(0)+'° col)'):'—');
+  S('sv_pct', lim&&col!=null?(Math.abs(frac)*100).toFixed(0)+'%'
+    +(near?'  ⚠ near lock':''):'—');
+  S('sv_mode', d.steer_mode
+    ? (d.steer_mode==='foc' ? 'FOC (Pro licence)' : 'duty (no licence)') : '—');
+  const m=(d.motors||{}).steer||{};
+  S('sv_mot', m.faults&&m.faults.length
+    ? (m.faults.join(',')) : (m.temp_c!=null?(m.temp_c+'°C'):'—'));
+}
+
+function drawChart(id,t,vals,o){
+  const s=setupCanvas(id);if(!s)return;const ctx=s.ctx,w=s.w,h=s.h;
+  ctx.clearRect(0,0,w,h);ctx.fillStyle='#161b22';ctx.fillRect(0,0,w,h);
+  ctx.font='11px ui-monospace,monospace';ctx.textAlign='left';
+  ctx.fillStyle='#8b949e';ctx.fillText(o.label,8,14);
+  const pts=[];for(let i=0;i<vals.length;i++){const v=vals[i];if(v!=null&&isFinite(v))pts.push([t[i],v]);}
+  const cur=pts.length?pts[pts.length-1][1]:null;
+  ctx.fillStyle=o.color;ctx.textAlign='right';
+  ctx.fillText(cur==null?'—':cur.toFixed(o.dec)+' '+o.unit,w-8,14);ctx.textAlign='left';
+  if(pts.length<2){ctx.fillStyle='#8b949e';ctx.fillText('waiting…',8,Math.round(h/2));return;}
+  const padL=8,padR=8,padT=22,padB=12;
+  let xmin=pts[0][0],xmax=pts[pts.length-1][0];
+  let ymin=Math.min.apply(null,pts.map(p=>p[1])),ymax=Math.max.apply(null,pts.map(p=>p[1]));
+  if(ymin===ymax){ymin-=1;ymax+=1;}
+  const yr=ymax-ymin;ymin-=yr*0.1;ymax+=yr*0.1;const xr=(xmax-xmin)||1;
+  const X=x=>padL+(x-xmin)/xr*(w-padL-padR);
+  const Y=y=>padT+(1-(y-ymin)/(ymax-ymin))*(h-padT-padB);
+  ctx.strokeStyle='#30363d';ctx.lineWidth=1;ctx.beginPath();
+  ctx.moveTo(padL,Y(ymin));ctx.lineTo(w-padR,Y(ymin));ctx.stroke();
+  ctx.strokeStyle=o.color;ctx.lineWidth=1.5;ctx.beginPath();
+  pts.forEach((p,i)=>{const x=X(p[0]),y=Y(p[1]);i?ctx.lineTo(x,y):ctx.moveTo(x,y);});ctx.stroke();
+}
+
+function drawMap(id,track,line){
+  const s=setupCanvas(id);if(!s)return;const ctx=s.ctx,w=s.w,h=s.h;
+  ctx.clearRect(0,0,w,h);ctx.fillStyle='#161b22';ctx.fillRect(0,0,w,h);
+  ctx.font='11px ui-monospace,monospace';ctx.fillStyle='#8b949e';ctx.textAlign='left';
+  const hasTrack=track&&track.length;
+  if(!hasTrack&&!line){ctx.fillText('waiting for GPS track…',8,Math.round(h/2));return;}
+  const ref=hasTrack?track[Math.floor(track.length/2)]:[line.lat,line.lon];
+  const lat0=ref[0]*Math.PI/180;
+  const toXY=(la,lo)=>[(lo-ref[1])*Math.cos(lat0)*111320,(la-ref[0])*111320];
+  const pts=(track||[]).map(p=>toXY(p[0],p[1]));
+  const lineXY=line?toXY(line.lat,line.lon):null;
+  let xs=pts.map(p=>p[0]),ys=pts.map(p=>p[1]);
+  if(lineXY){xs=xs.concat([lineXY[0]-line.r,lineXY[0]+line.r]);ys=ys.concat([lineXY[1]-line.r,lineXY[1]+line.r]);}
+  if(!xs.length){ctx.fillText('waiting for GPS track…',8,Math.round(h/2));return;}
+  const xmn=Math.min.apply(null,xs),xmx=Math.max.apply(null,xs);
+  const ymn=Math.min.apply(null,ys),ymx=Math.max.apply(null,ys);
+  const dx=(xmx-xmn)||10,dy=(ymx-ymn)||10,pad=26;
+  const sc=Math.min((w-2*pad)/dx,(h-2*pad)/dy);
+  const cx=(xmn+xmx)/2,cy=(ymn+ymx)/2;
+  const X=x=>w/2+(x-cx)*sc,Y=y=>h/2-(y-cy)*sc;
+  if(lineXY){
+    ctx.strokeStyle='#3fb950';ctx.setLineDash([4,4]);ctx.lineWidth=1.5;ctx.beginPath();
+    ctx.arc(X(lineXY[0]),Y(lineXY[1]),line.r*sc,0,2*Math.PI);ctx.stroke();ctx.setLineDash([]);
+    ctx.fillStyle='#3fb950';ctx.beginPath();ctx.arc(X(lineXY[0]),Y(lineXY[1]),4,0,2*Math.PI);ctx.fill();
+    ctx.fillText('S/F',X(lineXY[0])+6,Y(lineXY[1])-6);
+  }
+  if(pts.length>1){ctx.strokeStyle='#39c5cf';ctx.lineWidth=2;ctx.beginPath();
+    pts.forEach((p,i)=>{const x=X(p[0]),y=Y(p[1]);i?ctx.lineTo(x,y):ctx.moveTo(x,y);});ctx.stroke();}
+  if(pts.length){const c=pts[pts.length-1];ctx.fillStyle='#fff';ctx.strokeStyle='#000';ctx.lineWidth=1;
+    ctx.beginPath();ctx.arc(X(c[0]),Y(c[1]),5,0,2*Math.PI);ctx.fill();ctx.stroke();}
+  ctx.fillStyle='#8b949e';ctx.fillText('~'+Math.round(dx)+' m wide',8,h-8);
+}
+
+// Predicted vehicle trajectory from the CURRENT steering angle (bicycle
+// model). This is where the car actually goes if you hold this lock — as
+// opposed to /ethon/path, which is where the planner WANTS to go. Comparing
+// the two is the whole point. Works with no cameras: turn the wheel on the
+// bench and the arc sweeps.
+//   turn radius R = wheelbase / tan(delta),  +delta = left
+//   x = R sin(t),  y = R (1 - cos(t)),  t = arclen / R
+function arcPts(degRoadWheel, wheelbase, reach){
+  const d=(degRoadWheel||0)*Math.PI/180;
+  const pts=[];
+  if(!wheelbase||Math.abs(d)<0.0035){                 // ~0.2 deg = straight
+    for(let i=0;i<=12;i++) pts.push([reach*i/12,0]);
+    return pts;
+  }
+  const R=wheelbase/Math.tan(d);
+  // t is HEADING CHANGE in radians, not distance. reach/|R| is unbounded, so
+  // at full lock (R ~ 4.7 m here) a 12 m arc sweeps ~147 deg and curls back
+  // across the view. Cap it at a quarter turn: past that the preview stops
+  // being a useful "where am I pointed" cue.
+  const tmax=Math.min(reach/Math.abs(R), Math.PI/2);
+  // x uses |R| and y uses signed R. Using signed R for x too makes a
+  // right-hand turn run BACKWARDS through the car (negative forward
+  // distance), which draws as a diagonal across the view.
+  const aR=Math.abs(R);
+  for(let i=0;i<=24;i++){
+    const t=tmax*i/24;
+    pts.push([aR*Math.sin(t), R*(1-Math.cos(t))]);
+  }
+  return pts;
+}
+
+function drawBird(id,cones,path,drive){
+  const s=setupCanvas(id);if(!s)return;const ctx=s.ctx,w=s.w,h=s.h;
+  ctx.clearRect(0,0,w,h);ctx.fillStyle='#161b22';ctx.fillRect(0,0,w,h);
+  ctx.font='11px ui-monospace,monospace';ctx.textAlign='left';
+  const cx=w/2,cy=h/2,pad=18;
+  let m=8;
+  (cones||[]).forEach(p=>{m=Math.max(m,Math.abs(p[0]),Math.abs(p[1]));});
+  (path||[]).forEach(p=>{m=Math.max(m,Math.abs(p[0]),Math.abs(p[1]));});
+  const R=Math.max(10,m*1.1);const sc=(Math.min(w,h)/2-pad)/R;
+  const PX=(x,y)=>cx-y*sc,PY=(x,y)=>cy-x*sc;   // forward(+x)=up, left(+y)=left
+  ctx.strokeStyle='#30363d';ctx.lineWidth=1;ctx.fillStyle='#8b949e';
+  for(let r=5;r<=R;r+=5){ctx.beginPath();ctx.arc(cx,cy,r*sc,0,2*Math.PI);ctx.stroke();
+    ctx.fillText(r+'m',cx+3,cy-r*sc+11);}
+  ctx.strokeStyle='#262c36';ctx.beginPath();ctx.moveTo(cx,pad);ctx.lineTo(cx,h-pad);
+  ctx.moveTo(pad,cy);ctx.lineTo(w-pad,cy);ctx.stroke();
+  if(path&&path.length>1){ctx.strokeStyle='#58a6ff';ctx.lineWidth=2;ctx.beginPath();
+    path.forEach((p,i)=>{const x=PX(p[0],p[1]),y=PY(p[0],p[1]);i?ctx.lineTo(x,y):ctx.moveTo(x,y);});ctx.stroke();}
+  // ── predicted trajectory from the live steering angle ──
+  const d=drive||{};
+  const wb=+d.wheelbase_m||0;
+  // rw is in the SAME convention as the wheel panel: positive = steering
+  // RIGHT. Note that is the opposite sense to the vehicle frame used below,
+  // where +y is LEFT, so rw is negated when handed to arcPts. Do not "fix"
+  // one without the other or the arc mirrors the real steering.
+  const dsg=(d.steer_inverted===true)?1:-1;
+  const rw=(d.road_wheel_deg==null)?null:dsg*(+d.road_wheel_deg);
+  const rwMax=(d.road_wheel_max_deg==null)?null:Math.abs(+d.road_wheel_max_deg);
+  const poly=(pts,style,width,dash)=>{
+    ctx.save();ctx.setLineDash(dash||[]);ctx.strokeStyle=style;ctx.lineWidth=width;
+    ctx.beginPath();
+    pts.forEach((p,i)=>{const x=PX(p[0],p[1]),y=PY(p[0],p[1]);i?ctx.lineTo(x,y):ctx.moveTo(x,y);});
+    ctx.stroke();ctx.restore();
+  };
+  const reach=Math.min(R*0.95,12);
+  if(wb&&rwMax){                                    // steering envelope at full lock
+    poly(arcPts( rwMax,wb,reach),'#30363d',1,[4,4]);
+    poly(arcPts(-rwMax,wb,reach),'#30363d',1,[4,4]);
+  }
+  if(wb&&rw!=null&&d.steer_homed){                  // where it will actually go
+    poly(arcPts(-rw,wb,reach),'#f778ba',2.5);       // -rw: right-positive -> +y-left frame
+  }
+  ctx.fillStyle='#d29922';
+  (cones||[]).forEach(p=>{ctx.beginPath();ctx.arc(PX(p[0],p[1]),PY(p[0],p[1]),4,0,2*Math.PI);ctx.fill();});
+  ctx.fillStyle='#3fb950';ctx.beginPath();
+  ctx.moveTo(cx,cy-9);ctx.lineTo(cx-6,cy+6);ctx.lineTo(cx+6,cy+6);ctx.closePath();ctx.fill();
+  ctx.fillStyle='#8b949e';ctx.textAlign='right';
+  ctx.fillText('cones '+((cones||[]).length)+' · path '+((path||[]).length)+' pts',w-8,14);
+  ctx.textAlign='left';ctx.fillText('▲ forward',8,14);
+  // legend so the two curves are never confused
+  ctx.font='10px system-ui';
+  ctx.fillStyle='#58a6ff';ctx.fillText('— planner path',8,h-20);
+  ctx.fillStyle='#f778ba';
+  ctx.fillText('— steering now'+(rw==null?'':' ('+rw.toFixed(1)+'°)'),8,h-8);
+}
+
+// ── camera previews ───────────────────────────────────────────────────────
+// Cheap polling of one JPEG per source rather than MJPEG: the dashboard is a
+// stdlib HTTP server with no streaming, and a stuck MJPEG connection would
+// hold a thread. Cache-buster on each request so the browser never reuses a
+// stale frame.
+// Every configured source, not just the ones delivering frames. A source that
+// is configured but dead has no preview image, so without this row it is
+// simply invisible — you cannot tell "no camera" from "camera broken".
+// Also surfaces calibrated=false, which is otherwise silent and is the reason
+// detections never reach the planner.
+function updateCamStatus(fs){
+  const box=document.getElementById('camstat');if(!box)return;
+  const src=fs.sources||{};
+  const names=Object.keys(src);
+  if(!names.length){box.innerHTML='';return;}
+  box.innerHTML='';
+  for(const n of names){
+    const s=src[n]||{};
+    const alive=!!s.alive, cal=!!s.calibrated;
+    const chip=el('div');chip.className='srcchip';
+    const dot=el('span');dot.className='dot2';
+    dot.style.background=alive?'var(--grn)':'var(--red)';
+    chip.appendChild(dot);
+    const nm=el('span',null,n);nm.className='nm';chip.appendChild(nm);
+    chip.appendChild(el('span',null,alive?((+s.fps||0).toFixed(1)+' fps'):'down'));
+    if(alive) chip.appendChild(el('span',null,(s.detections||0)+' det'));
+    const c=el('span',null,cal?'cal':'UNCALIBRATED');
+    c.style.color=cal?'var(--grn)':'var(--amb)';
+    c.title=cal?'homography loaded — detections reach the planner'
+               :'no homography — detections go to /ethon/detections_raw only '
+               +'and are NEVER used by the planner. Run calibrate_homography.py.';
+    chip.appendChild(c);
+    box.appendChild(chip);
+  }
+}
+
+let camList=[], camSeq=0;
+async function camTick(){
+  try{
+    const r=await fetch('/api/cams',{cache:'no-store'});
+    const j=await r.json();
+    const cams=j.cams||[];
+    if(cams.join(',')!==camList.join(',')){        // rebuild only on change
+      camList=cams;
+      const wrap=document.getElementById('camwrap');
+      const none=document.getElementById('camnone');
+      wrap.innerHTML='';
+      none.style.display=cams.length?'none':'';
+      // Place each tile where its camera physically sits, rather than in
+      // whatever order the sources happened to be discovered.
+      const LAYOUT={left:[1,1], wide:[2,1], right:[3,1], narrow:[2,2]};
+      const ordered=[...cams].sort((a,b)=>{
+        const A=LAYOUT[a], B=LAYOUT[b];
+        if(A&&B) return (A[1]-B[1])||(A[0]-B[0]);   // row, then column
+        if(A) return -1;                            // known cameras first
+        if(B) return 1;
+        return a.localeCompare(b);                  // anything new: by name
+      });
+      for(const c of ordered){
+        const cell=el('div');cell.className='camcell';
+        const pos=LAYOUT[c];
+        if(pos){ cell.style.gridColumn=pos[0]; cell.style.gridRow=pos[1]; }
+        const img=el('img');img.id='cam_'+c;img.alt=c;
+        const lbl=el('div',null,c);lbl.className='camlbl';
+        cell.appendChild(img);cell.appendChild(lbl);wrap.appendChild(cell);
+      }
+    }
+    camSeq++;
+    for(const c of camList){
+      const img=document.getElementById('cam_'+c);
+      if(img) img.src='/api/cam?src='+encodeURIComponent(c)+'&_='+camSeq;
+    }
+  }catch(e){}
+}
+
+async function histTick(){
+  try{const r=await fetch('/api/history',{cache:'no-store'});const hh=await r.json();
+    drawMap('map',hh.track,hh.line);
+    lastHist=hh;                       // cached so the faster tick can redraw
+    drawBird('bird',hh.cones,hh.path,lastDrive);
+    drawChart('c_speed',hh.t,hh.speed,{color:'#58a6ff',label:'Speed',unit:'km/h',dec:1});
+    drawChart('c_energy',hh.t,hh.energy,{color:'#3fb950',label:'Energy',unit:'Wh',dec:0});
+    drawChart('c_whkm',hh.t,hh.whkm,{color:'#d29922',label:'Efficiency',unit:'Wh/km',dec:0});
+    drawChart('c_temp',hh.t,hh.temp,{color:'#f85149',label:'Motor temp',unit:'°C',dec:0});
+  }catch(e){}
+}
+
+let logSince=0,logRows=[];
+async function logTick(){
+  if(document.getElementById('logpause').checked)return;
+  try{const r=await fetch('/api/logs?since='+logSince,{cache:'no-store'});const j=await r.json();
+    if(j.logs&&j.logs.length){logRows=logRows.concat(j.logs);
+      if(logRows.length>600)logRows=logRows.slice(-600);logSince=j.last;renderLog();}
+  }catch(e){}
+}
+function renderLog(){
+  const lvl=parseInt(document.getElementById('loglevel').value);
+  const pre=document.getElementById('log');
+  const bottom=pre.scrollTop+pre.clientHeight>=pre.scrollHeight-30;
+  pre.innerHTML='';
+  for(const r of logRows){if(r.lvl<lvl)continue;
+    pre.appendChild(el('div','lg l'+r.lvl,'['+r.lvl_name+'] '+r.name+': '+r.msg));}
+  if(bottom)pre.scrollTop=pre.scrollHeight;
+}
+function clearLog(){logRows=[];renderLog();}
+
+async function selftest(){
+  const box=document.getElementById('selftest');
+  box.innerHTML='<span class="muted">running checks…</span>';
+  try{
+    const r=await fetch('/api/selftest',{cache:'no-store'});const j=await r.json();
+    box.innerHTML='';
+    const v=el('div','armbar '+(j.ready?'ok':'bad'),
+      (j.ready?'✓ ':'✗ ')+j.verdict);box.appendChild(v);
+    const tbl=el('table');
+    for(const c of j.checks){
+      const tr=el('tr');
+      tr.appendChild(el('td',c.ok?'ok':'bad',c.ok?'PASS':'FAIL'));
+      tr.appendChild(el('td',null,c.name));
+      tr.appendChild(el('td','pt',c.detail||''));
+      tbl.appendChild(tr);
+    }
+    box.appendChild(tbl);
+  }catch(e){box.textContent='self-test request failed';}
+}
+
+// ── motor bench test ──
+let testTimer=null;
+async function setFoc(on){
+  try{
+    const r=await fetch('/api/param',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({node:'/ethon_drive',name:'use_foc',type:1,value:on?'true':'false'})});
+    const j=await r.json();
+    toast(j.ok?('control mode -> '+(on?'FOC':'DUTY')):('mode set failed: '+(j.reason||'')),!j.ok);
+  }catch(e){toast('mode set failed',true);}
+}
+function testDuty(){
+  const mag=parseInt(document.getElementById('dutyslider').value)/100.0;
+  const rev=document.getElementById('dir-rev').checked;
+  return rev?-mag:mag;
+}
+async function postDuty(d){
+  try{await fetch('/api/drivetest',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({duty:d})});}catch(e){}
+}
+function startTest(){
+  if(testTimer)return;
+  postDuty(testDuty());                       // fire immediately
+  testTimer=setInterval(()=>postDuty(testDuty()),200);  // re-post < watchdog
+  document.getElementById('test-start').disabled=true;
+  document.getElementById('teststate').textContent=' RUNNING';
+  document.getElementById('teststate').style.color='var(--grn)';
+}
+function stopTest(){
+  if(testTimer){clearInterval(testTimer);testTimer=null;}
+  postDuty(0.0);                              // explicit stop + watchdog backstop
+  document.getElementById('test-start').disabled=false;
+  document.getElementById('teststate').textContent=' stopped';
+  document.getElementById('teststate').style.color='var(--mut)';
+}
+// safety: stop posting if the page is hidden/closed (watchdog also covers this)
+window.addEventListener('beforeunload',()=>{if(testTimer)postDuty(0.0);});
+document.addEventListener('visibilitychange',()=>{if(document.hidden)stopTest();});
+
+function updateTestPanel(s,drive){
+  const foc=drive.use_foc===true;
+  const md=document.getElementById('mode-duty'), mf=document.getElementById('mode-foc');
+  md.className=foc?'':'g'; mf.className=foc?'g':'';
+  document.getElementById('modestate').textContent=
+    drive.use_foc==null?'':(' active: '+(foc?'FOC':'DUTY'));
+  const dm=drive.motors||{};
+  const rows=Object.keys(dm).filter(k=>k!=='steer').map(k=>{
+    const m=dm[k]||{};
+    return k+': '+(m.vel_rps!=null?m.vel_rps+' rps':'—')+' / '
+      +(m.supply_a!=null?m.supply_a+'A':'—')
+      +(m.faults&&m.faults.length?' ['+m.faults.join(',')+']':'');
+  });
+  document.getElementById('testreadout').innerHTML=
+    'test_active: '+(drive.test_active?('<span style="color:var(--grn)">YES</span> duty '+drive.test_duty):'no')
+    +'<br>'+rows.join('<br>');
+}
+
+window.addEventListener('resize',()=>{histTick();});
+tick();setInterval(tick,600);
+histTick();setInterval(histTick,1200);
+logTick();setInterval(logTick,1200);
+camTick();setInterval(camTick,200);   // ~5 fps preview
+</script>
+</body>
+</html>
+"""
+
+
+PIT_PAGE = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ethon Pit</title>
+<style>
+:root{--bg:#0d1117;--card:#161b22;--edge:#30363d;--fg:#e6edf3;--mut:#8b949e;
+--grn:#3fb950;--red:#f85149;--amb:#d29922;--blu:#58a6ff;}
+*{box-sizing:border-box}
+body{margin:0;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+background:var(--bg);color:var(--fg)}
+header{display:flex;align-items:center;gap:14px;padding:10px 16px;border-bottom:1px solid var(--edge)}
+header h1{font-size:16px;margin:0}
+nav a{margin-right:10px;font-size:12px;text-decoration:none}
+main{padding:14px;max-width:1100px;margin:0 auto}
+#pace{border-radius:10px;padding:18px;text-align:center;font-size:44px;font-weight:800;
+letter-spacing:1px;background:var(--card);border:2px solid var(--edge);margin-bottom:12px}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:10px}
+.tile{background:var(--card);border:1px solid var(--edge);border-radius:10px;padding:14px;text-align:center}
+.tile .k{color:var(--mut);font-size:12px;text-transform:uppercase;letter-spacing:1px}
+.tile .v{font-size:40px;font-weight:700;margin-top:4px}
+.tile .s{color:var(--mut);font-size:13px;margin-top:2px}
+.alerts{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
+.al{padding:8px 14px;border-radius:8px;font-weight:700;background:var(--card);
+border:1px solid var(--edge);color:var(--mut)}
+.al.bad{background:var(--red);color:#fff;border-color:var(--red)}
+.al.warn{background:var(--amb);color:#000;border-color:var(--amb)}
+button{font:inherit;cursor:pointer;border:1px solid var(--grn);background:var(--card);
+color:var(--grn);border-radius:8px;padding:10px 18px;font-weight:700}
+</style>
+</head>
+<body>
+<header>
+  <h1>ETHON&nbsp;//&nbsp;PIT</h1>
+  <nav><a href="/dashboard" style="color:var(--mut)">DASH</a>
+  <a href="/pit" style="color:var(--blu)">PIT</a>
+  <a href="/replay" style="color:var(--mut)">REPLAY</a>
+  <a href="/calib" style="color:var(--mut)">CALIB</a></nav>
+  <span id="conn" style="margin-left:auto;color:var(--mut);font-size:12px">…</span>
+</header>
+<main>
+  <div id="pace">—</div>
+  <div class="tiles" id="tiles"></div>
+  <div class="alerts" id="alerts"></div>
+  <div style="margin-top:14px"><button onclick="if(confirm('Start the race clock?'))start()">START RACE</button></div>
+</main>
+<script>
+function el(t,c,x){const e=document.createElement(t);if(c)e.className=c;if(x!=null)e.textContent=x;return e;}
+function mmss(s){if(s==null)return '—';s=Math.max(0,Math.round(s));
+  return Math.floor(s/60)+':'+String(s%60).padStart(2,'0');}
+function fmtlap(s){if(s==null)return '—';const m=Math.floor(s/60);
+  return m+':'+(s-60*m).toFixed(1).padStart(4,'0');}
+async function start(){await fetch('/api/action',{method:'POST',
+  headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'race_start'})});}
+function tile(k,v,s){const t=el('div','tile');t.appendChild(el('div','k',k));
+  t.appendChild(el('div','v',v));if(s)t.appendChild(el('div','s',s));return t;}
+async function tick(){
+  try{
+    const r=await fetch('/api/state',{cache:'no-store'});const st=await r.json();
+    document.getElementById('conn').textContent='live';
+    const tp=st.topics||{};
+    const strat=(tp['/ethon/strategy']||{}).value||{};
+    const lap=(tp['/ethon/lap']||{}).value||{};
+    const corr=(tp['/ethon/corridor']||{}).value||{};
+    const drive=(tp['/ethon/drive_status']||{}).value||{};
+    const s=st.status||{};
+    const pace=document.getElementById('pace');
+    if(!strat.race_on){pace.textContent='RACE NOT STARTED';
+      pace.style.borderColor='var(--edge)';pace.style.color='var(--mut)';}
+    else{pace.textContent=strat.pace+'  ·  '+mmss(strat.remaining_s)+' left';
+      const c=strat.pace_n<0?'var(--red)':(strat.pace_n>0?'var(--grn)':'var(--blu)');
+      pace.style.borderColor=c;pace.style.color=c;}
+    const tiles=document.getElementById('tiles');tiles.innerHTML='';
+    tiles.appendChild(tile('Battery',(strat.battery_pct!=null?strat.battery_pct+'%':'—'),
+      (strat.wh_remaining!=null?strat.wh_remaining+' Wh left of '+strat.wh_budget:'')+' (estimate)'));
+    tiles.appendChild(tile('Battery V',(drive.supply_v!=null?drive.supply_v.toFixed(1):'—'),
+      'measured at the Krakens'));
+    tiles.appendChild(tile('Burn rate',(strat.rate_wh_min!=null?strat.rate_wh_min:'—'),
+      'Wh/min · budget '+(strat.budget_wh_min!=null?strat.budget_wh_min:'—')));
+    tiles.appendChild(tile('Speed',(s.speed_kmh!=null?s.speed_kmh:'—'),'km/h'));
+    tiles.appendChild(tile('Lap',(lap.lap!=null?lap.lap:'—'),
+      'last '+fmtlap(lap.last_s)+' · best '+fmtlap(lap.best_s)));
+    tiles.appendChild(tile('Wh / lap',(strat.wh_per_lap!=null?strat.wh_per_lap:'—'),
+      'last lap '+(strat.last_lap_wh!=null?strat.last_lap_wh+' Wh':'—')));
+    const mt=Object.values(drive.motors||{}).map(m=>m&&m.temp_c).filter(x=>x!=null);
+    tiles.appendChild(tile('Motor temp',(mt.length?Math.max.apply(null,mt):'—'),'°C hottest'));
+    tiles.appendChild(tile('Regen',(drive.regen_strength!=null?Math.round(drive.regen_strength*100)+'%':'—'),'e-brake strength'));
+    tiles.appendChild(tile('Projected',(strat.projected_wh!=null?strat.projected_wh:'—'),
+      'Wh at finish vs '+(strat.wh_budget||'—')));
+    const al=document.getElementById('alerts');al.innerHTML='';
+    al.appendChild(el('div','al'+(s.estop?' bad':''),s.estop?'E-STOP':'estop clear'));
+    al.appendChild(el('div','al'+(s.gps_fix===false?' bad':''),
+      s.gps_fix?'GPS OK':'GPS NO FIX'));
+    al.appendChild(el('div','al'+((corr.state==='warn'||corr.state==='off')?' warn':''),
+      'corridor: '+(corr.state||'—')));
+    al.appendChild(el('div','al'+(s.armed?'':''),(s.armed?'ARMED':'disarmed')));
+  }catch(e){document.getElementById('conn').textContent='disconnected';}
+}
+tick();setInterval(tick,1000);
+</script>
+</body>
+</html>
+"""
+
+
+REPLAY_PAGE = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ethon Replay</title>
+<style>
+:root{--bg:#0d1117;--card:#161b22;--edge:#30363d;--fg:#e6edf3;--mut:#8b949e;
+--grn:#3fb950;--red:#f85149;--amb:#d29922;--blu:#58a6ff;--cy:#39c5cf;}
+*{box-sizing:border-box}
+body{margin:0;font:14px/1.4 ui-monospace,Menlo,Consolas,monospace;background:var(--bg);color:var(--fg)}
+header{display:flex;align-items:center;gap:14px;padding:10px 16px;border-bottom:1px solid var(--edge)}
+header h1{font-size:16px;margin:0}
+nav a{margin-right:10px;font-size:12px;text-decoration:none}
+main{padding:16px;max-width:1100px;margin:0 auto}
+select{font:inherit;background:var(--card);color:var(--fg);border:1px solid var(--edge);
+border-radius:6px;padding:8px 10px;min-width:280px}
+.panel{background:var(--card);border:1px solid var(--edge);border-radius:8px;padding:6px;margin-top:12px}
+canvas{width:100%;display:block}
+#c_speed,#c_energy{height:170px}
+#map{height:300px}
+table{width:100%;border-collapse:collapse;margin-top:12px}
+td,th{text-align:left;padding:6px 8px;border-bottom:1px solid var(--edge)}
+th{color:var(--mut);font-size:11px;text-transform:uppercase}
+h2{font-size:13px;text-transform:uppercase;letter-spacing:1px;color:var(--mut);margin:18px 0 6px}
+.muted{color:var(--mut)}
+</style>
+</head>
+<body>
+<header>
+  <h1>ETHON&nbsp;//&nbsp;REPLAY</h1>
+  <nav><a href="/dashboard" style="color:var(--mut)">DASH</a>
+  <a href="/pit" style="color:var(--mut)">PIT</a>
+  <a href="/replay" style="color:var(--blu)">REPLAY</a>
+  <a href="/calib" style="color:var(--mut)">CALIB</a></nav>
+</header>
+<main>
+  <select id="sess" onchange="load()"><option>loading sessions…</option></select>
+  <span class="muted" id="meta"></span>
+  <h2>Speed (m/s)</h2><div class="panel"><canvas id="c_speed"></canvas></div>
+  <h2>Energy (Wh)</h2><div class="panel"><canvas id="c_energy"></canvas></div>
+  <h2>Track</h2><div class="panel"><canvas id="map"></canvas></div>
+  <h2>Laps</h2><div id="laps" class="muted">—</div>
+</main>
+<script>
+function el(t,c,x){const e=document.createElement(t);if(c)e.className=c;if(x!=null)e.textContent=x;return e;}
+function cv(id){const c=document.getElementById(id);const d=window.devicePixelRatio||1;
+  const w=c.clientWidth||600,h=c.clientHeight||160;c.width=w*d;c.height=h*d;
+  const x=c.getContext('2d');x.setTransform(d,0,0,d,0,0);return{x:x,w:w,h:h};}
+function line(id,t,vals,color){
+  const s=cv(id),x=s.x,w=s.w,h=s.h;x.fillStyle='#161b22';x.fillRect(0,0,w,h);
+  const pts=[];for(let i=0;i<vals.length;i++)if(vals[i]!=null)pts.push([t[i],vals[i]]);
+  if(pts.length<2){x.fillStyle='#8b949e';x.fillText('no data',10,h/2);return;}
+  const xm=pts[0][0],xM=pts[pts.length-1][0]||1;
+  let ym=Math.min.apply(null,pts.map(p=>p[1])),yM=Math.max.apply(null,pts.map(p=>p[1]));
+  if(ym===yM){ym-=1;yM+=1;}
+  const X=v=>10+(v-xm)/(xM-xm||1)*(w-20),Y=v=>h-14-(v-ym)/(yM-ym)*(h-30);
+  x.strokeStyle=color;x.lineWidth=1.6;x.beginPath();
+  pts.forEach((p,i)=>{i?x.lineTo(X(p[0]),Y(p[1])):x.moveTo(X(p[0]),Y(p[1]));});x.stroke();
+  x.fillStyle='#8b949e';x.font='11px monospace';
+  x.fillText(yM.toFixed(1),4,12);x.fillText(ym.toFixed(1),4,h-4);
+}
+function track(id,tr){
+  const s=cv(id),x=s.x,w=s.w,h=s.h;x.fillStyle='#161b22';x.fillRect(0,0,w,h);
+  if(!tr||tr.length<2){x.fillStyle='#8b949e';x.fillText('no GPS in this session',10,h/2);return;}
+  const ref=tr[Math.floor(tr.length/2)],la0=ref[0]*Math.PI/180;
+  const pts=tr.map(p=>[(p[1]-ref[1])*Math.cos(la0)*111320,(p[0]-ref[0])*111320]);
+  const xs=pts.map(p=>p[0]),ys=pts.map(p=>p[1]);
+  const xm=Math.min.apply(null,xs),xM=Math.max.apply(null,xs);
+  const ym=Math.min.apply(null,ys),yM=Math.max.apply(null,ys);
+  const sc=Math.min((w-40)/((xM-xm)||10),(h-40)/((yM-ym)||10));
+  const cx=(xm+xM)/2,cy=(ym+yM)/2;
+  x.strokeStyle='#39c5cf';x.lineWidth=2;x.beginPath();
+  pts.forEach((p,i)=>{const px=w/2+(p[0]-cx)*sc,py=h/2-(p[1]-cy)*sc;
+    i?x.lineTo(px,py):x.moveTo(px,py);});x.stroke();
+  x.fillStyle='#8b949e';x.fillText('~'+Math.round(xM-xm)+' m wide',8,h-8);
+}
+async function init(){
+  const r=await fetch('/api/sessions',{cache:'no-store'});const j=await r.json();
+  const sel=document.getElementById('sess');sel.innerHTML='';
+  if(!j.sessions.length){sel.appendChild(el('option',null,'no sessions logged yet'));return;}
+  for(const s of j.sessions){const o=el('option',null,s.name+'  ('+s.mtime+', '+s.kb+' kB)');
+    o.value=s.name;sel.appendChild(o);}
+  load();
+}
+async function load(){
+  const f=document.getElementById('sess').value;if(!f)return;
+  const r=await fetch('/api/session?f='+encodeURIComponent(f),{cache:'no-store'});
+  const d=await r.json();if(d.ok===false)return;
+  document.getElementById('meta').textContent=' '+d.n+' samples';
+  line('c_speed',d.t,d.speed,'#58a6ff');
+  line('c_energy',d.t,d.energy,'#3fb950');
+  track('map',d.track);
+  const box=document.getElementById('laps');
+  if(!d.laps.length){box.textContent='no completed laps in this session';return;}
+  box.className='';const tbl=el('table');const hr=el('tr');
+  for(const hh of ['Lap','Time','Wh'])hr.appendChild(el('th',null,hh));tbl.appendChild(hr);
+  for(const L of d.laps){const tr=el('tr');
+    tr.appendChild(el('td',null,L.lap));
+    tr.appendChild(el('td',null,L.lap_s==null?'—':(Math.floor(L.lap_s/60)+':'+(L.lap_s%60).toFixed(1).padStart(4,'0'))));
+    tr.appendChild(el('td',null,L.wh==null?'—':L.wh));
+    tbl.appendChild(tr);}
+  box.innerHTML='';box.appendChild(tbl);
+}
+init();
+</script>
+</body>
+</html>
+"""
+
+
+CALIB_PAGE = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ethon Calibration</title>
+<style>
+:root{--bg:#0d1117;--card:#161b22;--edge:#30363d;--fg:#e6edf3;--mut:#8b949e;
+--grn:#3fb950;--red:#f85149;--amb:#d29922;--blu:#58a6ff;--pk:#f778ba;}
+*{box-sizing:border-box}
+body{margin:0;font:14px/1.4 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+background:var(--bg);color:var(--fg)}
+header{display:flex;align-items:center;gap:14px;padding:10px 16px;border-bottom:1px solid var(--edge)}
+header h1{font-size:16px;margin:0}
+nav a{margin-right:10px;font-size:12px;text-decoration:none}
+main{padding:16px;max-width:1300px;margin:0 auto}
+.muted{color:var(--mut)}
+.row{display:flex;gap:16px;flex-wrap:wrap;align-items:flex-start}
+.panel{background:var(--card);border:1px solid var(--edge);border-radius:8px;padding:10px}
+select{font:inherit;background:var(--card);color:var(--fg);border:1px solid var(--edge);
+border-radius:6px;padding:7px 10px;min-width:260px}
+button{font:inherit;cursor:pointer;border:1px solid var(--edge);background:var(--card);
+color:var(--fg);border-radius:6px;padding:7px 14px}
+button:hover{border-color:var(--blu)}
+.imgwrap{position:relative;line-height:0}
+#shot{max-width:100%;height:auto;cursor:crosshair;border-radius:4px;display:block}
+#loupe{position:absolute;top:8px;right:8px;border:2px solid var(--pk);border-radius:6px;
+background:#000;pointer-events:none}
+#loupecoord{position:absolute;top:8px;left:8px;background:rgba(0,0,0,.65);
+padding:2px 8px;border-radius:4px;font-size:12px;pointer-events:none}
+.side{flex:0 0 340px;min-width:280px}
+table{width:100%;border-collapse:collapse;margin-top:6px}
+td,th{text-align:left;padding:4px 6px;border-bottom:1px solid var(--edge);font-size:12px}
+th{color:var(--mut);text-transform:uppercase;font-size:10px}
+input.pv{font:inherit;background:#0d1117;color:var(--fg);border:1px solid var(--edge);
+border-radius:5px;padding:4px 6px;width:64px;font-size:12px}
+textarea{font:inherit;font-size:12px;width:100%;background:#0d1117;color:var(--grn);
+border:1px solid var(--edge);border-radius:6px;padding:8px;resize:vertical;min-height:64px}
+#toast2{position:fixed;bottom:16px;right:16px;background:var(--card);border:1px solid var(--edge);
+border-radius:8px;padding:10px 14px;opacity:0;transition:opacity .2s;pointer-events:none}
+#toast2.show{opacity:1}
+.hint{font-size:12px;color:var(--mut);margin:6px 0 12px;line-height:1.5}
+.badge{display:inline-block;font-size:10px;padding:1px 6px;border-radius:10px;
+border:1px solid var(--edge);margin-left:6px}
+.badge.cal{color:var(--grn);border-color:var(--grn)}
+</style>
+</head>
+<body>
+<header>
+  <h1>ETHON&nbsp;//&nbsp;CALIB</h1>
+  <nav><a href="/dashboard" style="color:var(--mut)">DASH</a>
+  <a href="/pit" style="color:var(--mut)">PIT</a>
+  <a href="/replay" style="color:var(--mut)">REPLAY</a>
+  <a href="/calib" style="color:var(--blu)">CALIB</a></nav>
+</header>
+<main>
+  <div class="hint">
+    Pixel-picker for <code>calibrate_homography.py --solve</code>. This page only reads
+    coordinates off a snapshot already on disk and builds the command for you to run over
+    SSH &mdash; it does not capture frames or solve the homography itself, so
+    <code>calibrate_homography.py</code> stays the one place that math happens.
+    Click a marker's exact centre on the image below (use the magnifier, top-right, for
+    precision near the fisheye edges), then fill in its measured ground position in
+    <b>metres</b> &mdash; x = forward from the rear axle, y = left (right is negative).
+  </div>
+  <div class="row" style="margin-bottom:10px">
+    <select id="src"></select>
+    <button id="reload">&#8635; reload sources</button>
+    <button id="clearpts">clear points</button>
+    <span class="muted" id="dims"></span>
+  </div>
+  <div class="row">
+    <div class="panel imgwrap" style="flex:1 1 600px">
+      <canvas id="shot" width="1" height="1"></canvas>
+      <canvas id="loupe" width="200" height="200"></canvas>
+      <div id="loupecoord"></div>
+    </div>
+    <div class="side panel">
+      <div id="points" class="muted">click the image to add markers</div>
+      <div style="margin-top:12px">
+        <div class="muted" style="margin-bottom:4px">generated command (run on the Jetson):</div>
+        <textarea id="cmd" readonly></textarea>
+        <button id="copybtn" style="margin-top:6px">copy</button>
+      </div>
+    </div>
+  </div>
+</main>
+<div id="toast2"></div>
+<script>
+function el(t,c,txt){const e=document.createElement(t);if(c)e.className=c;if(txt!=null)e.textContent=txt;return e;}
+let img=new Image(), natW=0, natH=0, points=[], currentSrc=null;
+
+async function loadSources(){
+  const r=await fetch('/api/calib_snapshots',{cache:'no-store'});
+  const j=await r.json();
+  const sel=document.getElementById('src');
+  const cur=sel.value;
+  sel.innerHTML='';
+  const keys=Object.keys(j.snapshots).sort();
+  if(!keys.length){sel.appendChild(el('option',null,'no snapshots yet -- run calibrate_homography.py first'));return;}
+  for(const k of keys){
+    const info=j.snapshots[k];
+    const o=el('option',null,k+'   ('+info.mtime+')'+(info.calibrated?'  [already calibrated]':''));
+    o.value=k;sel.appendChild(o);
+  }
+  if(keys.includes(cur))sel.value=cur;
+  loadImage(sel.value);
+}
+
+function loadImage(src){
+  if(!src)return;
+  currentSrc=src;points=[];renderPoints();updateCmd();
+  img=new Image();
+  img.onload=()=>{
+    natW=img.naturalWidth;natH=img.naturalHeight;
+    const cv=document.getElementById('shot');
+    cv.width=natW;cv.height=natH;
+    redraw();
+    document.getElementById('dims').textContent=natW+' x '+natH+' px';
+  };
+  img.src='/api/calib_snapshot?src='+encodeURIComponent(src)+'&_='+Date.now();
+}
+
+function redraw(){
+  const cv=document.getElementById('shot');const ctx=cv.getContext('2d');
+  if(!natW)return;
+  ctx.drawImage(img,0,0);
+  const r=Math.max(4,natW/150),lw=Math.max(1,natW/500);
+  points.forEach((p,i)=>{
+    ctx.strokeStyle='#f778ba';ctx.fillStyle='#f778ba';ctx.lineWidth=lw;
+    ctx.beginPath();ctx.moveTo(p.u-r,p.v);ctx.lineTo(p.u+r,p.v);
+    ctx.moveTo(p.u,p.v-r);ctx.lineTo(p.u,p.v+r);ctx.stroke();
+    ctx.beginPath();ctx.arc(p.u,p.v,r*1.6,0,2*Math.PI);ctx.stroke();
+    ctx.font=Math.max(12,natW/60)+'px system-ui';
+    ctx.fillText(String(i+1),p.u+r*1.8,p.v-r*0.5);
+  });
+}
+
+function canvasCoords(ev){
+  const cv=document.getElementById('shot');const rect=cv.getBoundingClientRect();
+  const sx=cv.width/rect.width,sy=cv.height/rect.height;
+  let u=(ev.clientX-rect.left)*sx,v=(ev.clientY-rect.top)*sy;
+  u=Math.max(0,Math.min(natW-1,u));v=Math.max(0,Math.min(natH-1,v));
+  return {u:u,v:v};
+}
+
+function updateLoupe(ev){
+  if(!natW)return;
+  const {u,v}=canvasCoords(ev);
+  const lp=document.getElementById('loupe');const lctx=lp.getContext('2d');
+  const zoom=6,half=lp.width/(2*zoom);
+  lctx.imageSmoothingEnabled=false;
+  lctx.clearRect(0,0,lp.width,lp.height);
+  lctx.drawImage(img,u-half,v-half,half*2,half*2,0,0,lp.width,lp.height);
+  lctx.strokeStyle='#f778ba';lctx.lineWidth=1;
+  lctx.beginPath();
+  lctx.moveTo(lp.width/2,0);lctx.lineTo(lp.width/2,lp.height);
+  lctx.moveTo(0,lp.height/2);lctx.lineTo(lp.width,lp.height/2);
+  lctx.stroke();
+  document.getElementById('loupecoord').textContent='u='+u.toFixed(0)+'  v='+v.toFixed(0);
+}
+
+function onClick(ev){
+  if(!natW)return;
+  const {u,v}=canvasCoords(ev);
+  points.push({u:Math.round(u),v:Math.round(v),x:'',y:''});
+  redraw();renderPoints();updateCmd();
+}
+
+function renderPoints(){
+  const box=document.getElementById('points');box.innerHTML='';
+  if(!points.length){box.appendChild(el('div','muted','click the image to add markers'));return;}
+  const tbl=el('table');const hdr=el('tr');
+  for(const h of ['#','u','v','x (fwd, m)','y (left, m)',''])hdr.appendChild(el('th',null,h));
+  tbl.appendChild(hdr);
+  points.forEach((p,i)=>{
+    const tr=el('tr');
+    tr.appendChild(el('td',null,String(i+1)));
+    tr.appendChild(el('td',null,String(p.u)));
+    tr.appendChild(el('td',null,String(p.v)));
+    const tx=el('td');const ix=el('input','pv');ix.value=p.x;ix.placeholder='e.g. 1.5';
+    ix.oninput=()=>{p.x=ix.value;updateCmd();};tx.appendChild(ix);tr.appendChild(tx);
+    const ty=el('td');const iy=el('input','pv');iy.value=p.y;iy.placeholder='e.g. 0.9';
+    iy.oninput=()=>{p.y=iy.value;updateCmd();};ty.appendChild(iy);tr.appendChild(ty);
+    const td=el('td');const rb=el('button',null,'×');
+    rb.onclick=()=>{points.splice(i,1);redraw();renderPoints();updateCmd();};
+    td.appendChild(rb);tr.appendChild(td);
+    tbl.appendChild(tr);
+  });
+  box.appendChild(tbl);
+}
+
+function srcFlag(){
+  if(!currentSrc)return'';
+  if(currentSrc.indexOf('cam_tcp')===0)return'--tcp '+currentSrc.slice('cam_tcp'.length);
+  if(currentSrc.indexOf('cam')===0)return'--camera '+currentSrc.slice('cam'.length);
+  return'';
+}
+
+function updateCmd(){
+  const box=document.getElementById('cmd');
+  const ready=points.filter(p=>p.x!==''&&p.y!==''&&!isNaN(parseFloat(p.x))&&!isNaN(parseFloat(p.y)));
+  if(!currentSrc){box.value='# pick a source above';return;}
+  if(ready.length<4){box.value='# need >= 4 points with x,y filled in ('+ready.length+' ready)';return;}
+  const pts=ready.map(p=>p.u+','+p.v+','+parseFloat(p.x)+','+parseFloat(p.y)).join('  ');
+  box.value='python3 calibrate_homography.py '+srcFlag()+' --solve \\\n    "'+pts+'"';
+}
+
+function copyCmd(){
+  const box=document.getElementById('cmd');
+  box.select();box.setSelectionRange(0,99999);
+  try{document.execCommand('copy');toast2('copied');}catch(e){toast2('select + copy manually');}
+}
+function toast2(msg){
+  const t=document.getElementById('toast2');
+  t.textContent=msg;t.className='show';setTimeout(()=>t.className='',1500);
+}
+
+document.getElementById('src').addEventListener('change',e=>loadImage(e.target.value));
+document.getElementById('shot').addEventListener('click',onClick);
+document.getElementById('shot').addEventListener('mousemove',updateLoupe);
+document.getElementById('reload').addEventListener('click',loadSources);
+document.getElementById('clearpts').addEventListener('click',()=>{points=[];redraw();renderPoints();updateCmd();});
+document.getElementById('copybtn').addEventListener('click',copyCmd);
+loadSources();
+</script>
+</body>
+</html>
+"""
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "EthonDash/1.0"
+
+    def log_message(self, *_a):
+        pass
+
+    def _send(self, code, body, ctype):
+        if isinstance(body, str):
+            body = body.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _json(self, obj, code=200):
+        self._send(code, json.dumps(obj), "application/json")
+
+    def _send_cam(self, src):
+        """Serve one annotated camera frame written by birdseye_fusion.
+
+        `src` is matched against the discovered source list rather than being
+        pasted into a path, so a crafted query cannot read arbitrary files.
+        """
+        if src not in _list_cams():
+            self._json({"ok": False, "reason": "unknown source"}, 404)
+            return
+        try:
+            with open(os.path.join(CAM_DIR, CAM_PREFIX + src + ".jpg"),
+                      "rb") as f:
+                blob = f.read()
+        except OSError:
+            self._json({"ok": False, "reason": "no frame yet"}, 404)
+            return
+        self._send(200, blob, "image/jpeg")
+
+    def _send_calib_snapshot(self, src):
+        """Serve a calibration snapshot at FULL resolution, no downscaling --
+        the /calib page's pixel picker must read coordinates off exactly the
+        same pixels calibrate_homography.py itself wrote, or the u,v fed to
+        --solve won't match what it captured.
+
+        `src` is matched against _list_calib_snapshots() rather than pasted
+        into a path, same defensive pattern as _send_cam.
+        """
+        if src not in _list_calib_snapshots():
+            self._json({"ok": False, "reason": "unknown snapshot"}, 404)
+            return
+        try:
+            with open(os.path.join(CALIB_DIR, src + "_snapshot.jpg"),
+                      "rb") as f:
+                blob = f.read()
+        except OSError:
+            self._json({"ok": False, "reason": "read failed"}, 404)
+            return
+        self._send(200, blob, "image/jpeg")
+
+    def _body(self):
+        try:
+            n = int(self.headers.get("Content-Length", 0))
+        except (TypeError, ValueError):
+            n = 0
+        if not n:
+            return {}
+        try:
+            return json.loads(self.rfile.read(n).decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return {}
+
+    def do_GET(self):
+        node = self.server.node
+        path = urlparse(self.path)
+        p = path.path
+        if p in ("/", "/dashboard", "/index.html"):
+            self._send(200, PAGE, "text/html; charset=utf-8")
+        elif p == "/pit":
+            self._send(200, PIT_PAGE, "text/html; charset=utf-8")
+        elif p == "/replay":
+            self._send(200, REPLAY_PAGE, "text/html; charset=utf-8")
+        elif p == "/calib":
+            self._send(200, CALIB_PAGE, "text/html; charset=utf-8")
+        elif p == "/api/cams":
+            self._json({"cams": _list_cams()})
+        elif p == "/api/cam":
+            q = parse_qs(path.query)
+            self._send_cam((q.get("src") or [""])[0])
+        elif p == "/api/calib_snapshots":
+            self._json({"snapshots": _list_calib_snapshots()})
+        elif p == "/api/calib_snapshot":
+            q = parse_qs(path.query)
+            self._send_calib_snapshot((q.get("src") or [""])[0])
+        elif p == "/api/state":
+            self._json(node.state())
+        elif p == "/api/selftest":
+            self._json(node.selftest())
+        elif p == "/api/sessions":
+            self._json({"sessions": node.list_sessions()})
+        elif p == "/api/session":
+            q = parse_qs(path.query)
+            data = node.read_session((q.get("f") or [""])[0])
+            if data is None:
+                self._json({"ok": False, "reason": "bad session"}, 404)
+            else:
+                self._json(data)
+        elif p == "/api/history":
+            self._json(node.history())
+        elif p == "/api/logs":
+            q = parse_qs(path.query)
+            try:
+                since = int((q.get("since") or ["0"])[0])
+            except ValueError:
+                since = 0
+            self._json(node.logs(since))
+        elif p == "/api/params":
+            q = parse_qs(path.query)
+            tgt = (q.get("node") or [""])[0]
+            if tgt not in PARAM_NODES:
+                self._json({"ok": False, "reason": "unknown node"}, 400)
+                return
+            params = node.list_params(tgt)
+            if params is None:
+                self._json({"ok": False, "reason": "node unreachable"}, 200)
+            else:
+                self._json({"ok": True, "node": tgt, "params": params})
+        elif p == "/favicon.ico":
+            self._send(204, b"", "image/x-icon")
+        else:
+            self._json({"ok": False, "reason": "not found"}, 404)
+
+    def do_POST(self):
+        node = self.server.node
+        p = urlparse(self.path).path
+        body = self._body()
+        if p == "/api/action":
+            ok, reason = node.action(body.get("action", ""), body.get("arg"))
+            self._json({"ok": ok, "reason": reason})
+        elif p == "/api/drivetest":
+            ok, reason = node.drive_test(body.get("duty", 0.0))
+            self._json({"ok": ok, "reason": reason})
+        elif p == "/api/param":
+            tgt = body.get("node", "")
+            if tgt not in PARAM_NODES:
+                self._json({"ok": False, "reason": "unknown node"}, 400)
+                return
+            ok, reason = node.set_param(
+                tgt, body.get("name", ""), body.get("type"), body.get("value"))
+            self._json({"ok": ok, "reason": reason})
+        else:
+            self._json({"ok": False, "reason": "not found"}, 404)
+
+
+def main():
+    rclpy.init()
+    node = EthonDashboard()
+    exe = MultiThreadedExecutor(num_threads=4)
+    exe.add_node(node)
+    spin = threading.Thread(target=exe.spin, daemon=True)
+    spin.start()
+    time.sleep(2.0)
+    node.rescan()
+    httpd = ThreadingHTTPServer(("0.0.0.0", HTTP_PORT), Handler)
+    httpd.node = node
+    node.get_logger().info("HTTP server listening on 0.0.0.0:%d" % HTTP_PORT)
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        httpd.shutdown()
+        exe.shutdown()
+        node.destroy_node()
+        try:
+            rclpy.shutdown()
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    main()

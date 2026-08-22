@@ -1,0 +1,10 @@
+# Ethon HMI mode-switch privilege drop-in.
+#
+# Lets the jetson user (running ethon-hmi.service) flip capture<->autonomy
+# without a password — scoped to the single audited helper script, nothing else.
+#
+# Install (MUST be mode 0440, root-owned, validated by visudo):
+#     sudo install -m 0440 -o root -g root \
+#         /home/jetson/ethon/ethon-hmi.sudoers /etc/sudoers.d/ethon-hmi
+#     sudo visudo -cf /etc/sudoers.d/ethon-hmi   # syntax check
+jetson ALL=(root) NOPASSWD: /home/jetson/ethon/ethon_set_mode.sh capture, /home/jetson/ethon/ethon_set_mode.sh autonomy

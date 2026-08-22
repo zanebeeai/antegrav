@@ -1,0 +1,33 @@
+# ethon-stack.service — full autonomy stack (perception + planner + health + drive)
+#
+# DISABLED BY DEFAULT.  Enable only for car (autonomy) use:
+#     sudo systemctl disable ethon-capture && sudo systemctl enable ethon-stack
+# and reverse the two commands to go back to data-collection (capture) mode.
+#
+# Conflicts=ethon-capture.service: birdseye_fusion and ethon_capture both open
+# the CSI cameras via nvarguscamerasrc — they can never run at the same time.
+# systemd will stop ethon-capture if this unit is started, and vice versa.
+#
+# Install:
+#     sudo cp /home/jetson/ethon/ethon-stack.service /etc/systemd/system/
+#     sudo systemctl daemon-reload
+
+[Unit]
+Description=Ethon autonomy stack (ros2 launch ethon_stack.launch.py)
+After=network-online.target ethon-can.service
+Wants=network-online.target
+Conflicts=ethon-capture.service
+
+[Service]
+Type=simple
+User=jetson
+WorkingDirectory=/home/jetson/ethon
+ExecStart=/bin/bash -lc 'source /opt/ros/humble/setup.bash && export ROS_DOMAIN_ID=42 RMW_IMPLEMENTATION=rmw_cyclonedds_cpp && exec ros2 launch /home/jetson/ethon/ethon_stack.launch.py'
+Restart=on-failure
+RestartSec=10
+# SIGINT first so rclpy nodes shut down cleanly (motors neutral) before SIGKILL
+KillSignal=SIGINT
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target

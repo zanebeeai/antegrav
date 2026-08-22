@@ -1,0 +1,26 @@
+# ethon-lap.service — GPS lap timer (publishes /ethon/lap for the Nextion HMI)
+#
+# Runs ALWAYS (both capture and autonomy modes); it only consumes /gps/fix and
+# has no camera/CAN conflicts. Pairs with ethon-hmi.service.
+#
+# Install:
+#     sudo cp /home/jetson/ethon/ethon-lap.service /etc/systemd/system/
+#     sudo systemctl daemon-reload && sudo systemctl enable --now ethon-lap
+
+[Unit]
+Description=Ethon GPS lap timer (/ethon/lap)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=jetson
+WorkingDirectory=/home/jetson/ethon
+ExecStart=/bin/bash -lc 'source /opt/ros/humble/setup.bash && export ROS_DOMAIN_ID=42 RMW_IMPLEMENTATION=rmw_cyclonedds_cpp ROS_LOCALHOST_ONLY=1 && exec python3 /home/jetson/ethon/lap_timer.py'
+Restart=on-failure
+RestartSec=5
+KillSignal=SIGINT
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

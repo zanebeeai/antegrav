@@ -1,0 +1,13 @@
+[Unit]
+Description=Ethon race services (corridor warning + energy strategist + session logger)
+After=network-online.target
+
+[Service]
+User=jetson
+WorkingDirectory=/home/jetson/ethon
+ExecStart=/bin/bash -lc 'source /opt/ros/humble/setup.bash && export ROS_DOMAIN_ID=42 RMW_IMPLEMENTATION=rmw_cyclonedds_cpp ROS_LOCALHOST_ONLY=1 && exec python3 /home/jetson/ethon/race_services.py'
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,198 @@
+# ============================================================================
+# Ethon vehicle configuration — read by ethon_drive.py at startup.
+#
+# DEPLOY TO: /home/jetson/ethon/vehicle.yaml   (this repo copy is the template)
+#
+# Every key overrides the matching built-in default in ethon_drive.py
+# (CONFIG_DEFAULTS). Omitted keys fall back to the defaults, which equal the
+# values shown here. Unknown keys are ignored with a warning. If this file is
+# missing or malformed the node logs it and runs on built-in defaults.
+#
+# !! Keys marked MEASURE are placeholders. Measure them on the car and
+# !! update this file BEFORE the first drive.
+# ============================================================================
+
+# ── CAN ─────────────────────────────────────────────────────────────────────
+# Bus name. Was "canivore" with a probe-then-fallback-to-can0 default, but
+# this project has no CANivore hardware (motors are on the Jetson's native
+# can0/mttcan controller) and the canivore probe raced with the real can0
+# devices on startup, occasionally leaving the node stuck reporting
+# can_bus=canivore with every motor "unavailable" even though can0 was
+# working fine. Hardcoded to can0 (2026-07-04) to remove that whole failure
+# mode. If a CANivore is ever added, set this back to its bus name.
+can_bus: can0
+
+drive_master_id: 0          # Kraken X60, drive master
+drive_follower_ids: [1, 2]  # Kraken X60 drive followers (same orientation)
+steer_can_id: 4             # Kraken X60 on the steering-column belt
+cancoder_can_id: 5          # CANcoder on the column (absolute homing; may be absent)
+
+# ── drivetrain ──────────────────────────────────────────────────────────────
+wheel_dia_m: 0.6604         # 26-inch rear wheel, metres
+gear_ratio: 11.46           # motor rotations per wheel rotation
+max_speed_ms: 8.0           # /cmd_vel linear.x saturation speed, m/s
+drive_inverted: false       # BENCH-VERIFY with wheels off the ground: positive
+                            # /cmd_vel linear.x must roll the car FORWARD.
+                            # Wrong direction -> flip this, never rewire.
+steer_inverted: true        # FLIPPED 2026-08-05 with the move to gears.
+                            # A belt drives the column the SAME way the motor
+                            # turns; a single external gear mesh drives it the
+                            # OPPOSITE way. Inverting the motor cancels that,
+                            # so every downstream convention (command sign,
+                            # reported position, steer_home_right_sign) keeps
+                            # its previous meaning and did NOT need changing.
+                            # BENCH-VERIFY before driving: positive angular.z
+                            # must steer LEFT, and homing must sweep RIGHT
+                            # first. If either is backwards, flip this back
+                            # rather than patching signs elsewhere.
+max_drive_a: 80.0           # full TorqueCurrentFOC drive current (cool motors)
+min_drive_a: 50.0           # derated current at/above derate_hi_c
+derate_lo_c: 55.0           # derate begins at this hottest-motor temp, C
+derate_hi_c: 70.0           # derate fully applied at this temp, C
+reverse_cap: 0.30           # reverse torque as a fraction of the derated limit
+reverse_speed_frac: 0.30    # hold-to-reverse SPEED cap (2026-08-18): with the
+                            # wheel REVERSE button held, full pedal commands
+                            # this fraction of max_speed_ms (0.30 -> 2.4 m/s)
+                            # instead of the full forward range.
+regen_a: 40.0               # max regen braking current (single-pedal lift-off)
+regen_deadband_ms: 0.5      # wheel speed must exceed command by this (m/s) before regen
+regen_ramp_ms: 2.0          # speed error (m/s) at which regen reaches full current
+
+# control mode. true = TorqueCurrentFOC (precise closed-loop current control,
+# but requires a Phoenix Pro license PER DEVICE); false = DutyCycleOut, open-
+# loop, works on unlicensed devices. Live-toggleable from the dashboard, so
+# this is just the boot default. Currently false because the Krakens are not
+# Pro-licensed for non-FRC use — flip to true if/when that is resolved.
+use_foc: false
+test_max_duty: 0.30         # dashboard bench-test duty-cycle safety cap (fraction)
+
+# ── duty-mode drive law (used while use_foc is false) ──────────────────────
+# Duty cycle is a SPEED-like actuator, not a torque: running the single-pedal
+# torque map through it made the map's 0.5 m/s fade band act as a P speed loop
+# with ~36x gain — the surging/jitter seen on the bench 2026-08-18. Duty mode
+# now uses  duty = v_cmd/duty_kv_ms + kp*(v_cmd - wheel_speed)  with braking
+# on its own steeper gain and its own LOW cap (negative duty while rolling is
+# plugging — harsh per unit duty). All four gains are LIVE-tuneable from the
+# dashboard param editor (node ethon_drive); values here are boot defaults —
+# write back anything you settle on.
+duty_kv_ms: 18.0            # TUNE — wheel m/s at duty 1.0. Bench-measure: spin
+                            # the wheel at a fixed test duty, read wheel_speed_ms
+                            # from drive_status, divide. ~free speed ≈ 18.
+duty_kp: 0.02               # TUNE — duty per m/s of speed error while driving.
+                            # Raise if it tracks the pedal sluggishly; too high
+                            # brings the old surging back.
+duty_brake_kp: 0.08         # TUNE — duty per m/s of overspeed while braking
+                            # (full brake cap at ~2 m/s over, like the old
+                            # regen ramp). Scaled by the regen_strength dial.
+duty_brake_max: 0.15        # braking/plugging duty cap. Raise carefully: this
+                            # is the lift-off brake bite in duty mode.
+duty_ramp_s: 0.15           # device-side 0->full duty ramp (seconds), runs at
+                            # 1 kHz on the Talon; smooths 50 Hz steps and the
+                            # bench test. NeutralOut/watchdog cuts stay instant.
+
+# ── steering ────────────────────────────────────────────────────────────────
+wheelbase_m: 1.524          # MEASURE — rear axle to front axle, metres
+steer_col_ratio: 12.0       # MEASURE — steering-wheel degrees per road-wheel degree
+steer_belt_ratio: 5.0       # motor rotations per steering-column rotation.
+                            # 2026-08-05: belt (14T:56T HTD) REPLACED by a
+                            # spur gear pair 18T:90T = 5.0:1, module 1.25,
+                            # centre distance 67.5 mm (2.657 in). The belt
+                            # only engaged ~4.7 teeth at that C-C (below the
+                            # ~6 minimum) and could ratchet under a stall
+                            # against the lock stops -- which would silently
+                            # destroy the homing reference, since position is
+                            # measured at the motor. Gears stay fully meshed.
+                            # Name kept for compatibility; it is just the
+                            # motor:column reduction whatever drives it.
+steer_limit_rot: 0.40       # measured 2026-08-16: real half-range is ~0.456 rot, margin below it
+steer_max_a: 45.0           # torque cap — the DRIVER MUST BE ABLE TO OVERPOWER
+                            # the motor by hand. Do not raise without re-testing
+                            # hand-overpower on the bench.
+
+# ── steering closed-loop gains ──────────────────────────────────────────────
+# Two slots so the use_foc toggle swaps control mode without retuning:
+#   slot 0  PositionTorqueCurrentFOC  (amps per ROTOR rotation of error, Pro)
+#   slot 1  PositionDutyCycle         (duty fraction per ROTOR rotation, free)
+# 1 column rotation = steer_belt_ratio (4.0) rotor rotations.
+# ALL UNTUNED STARTING POINTS — bench-tune with the wheels off the ground:
+# raise kp until it tracks without hunting, then add a little kd to damp it.
+steer_kp_foc: 8.0           # TUNE
+steer_kd_foc: 0.1           # TUNE
+steer_kp_duty: 0.30         # TUNE — used when use_foc is false (the default)
+steer_kd_duty: 0.02         # TUNE — raised from 0.004 (2026-08-18): that was
+                            # ~zero damping and the loop hunted/jittered
+                            # through the gear backlash. If it still hunts at
+                            # standstill, raise kd first, then lower kp.
+steer_slew_col_rps: 1.5     # column-target slew limit, rot/s. The Ackermann
+                            # target recomputed at 50 Hz dithers with omega
+                            # noise; this stops the wheel chasing it. 1.5
+                            # covers the full ±0.40 rot range in ~0.27 s.
+                            # LIVE-tuneable (ethon_drive param). steer_test
+                            # bypasses it so bench steps stay clean.
+steer_peak_duty: 0.25       # duty cap for the non-FOC steering path. This is
+                            # the hand-overpower guarantee in duty mode — raise
+                            # only after re-testing that you can still fight it.
+# homing method:
+#   cancoder      seed the rotor from the absolute CANcoder at boot (needs the
+#                 CANcoder + cancoder_offset_rot; park wheels straight).
+#   lock_to_lock  sweep to both mechanical stops, centre on the midpoint, and
+#                 derive the soft limits from the measured range (no CANcoder
+#                 or offset needed). UNTESTED ON HARDWARE — bench-verify with
+#                 the wheels off the ground and a hand on the wheel.
+steer_home_method: cancoder
+
+# ── lock-to-lock homing tuning (only used when steer_home_method=lock_to_lock)
+# Sequence at every node start: sweep RIGHT to the stop, sweep LEFT to the
+# stop, centre on the midpoint, then re-zero. The sweep is open-loop duty (no
+# Pro licence) but the torque pushed into the stop is bounded by the stator
+# current limit below, which is applied for the sweep and restored to
+# steer_max_a afterwards. Device soft limits are disabled during the sweep
+# (the power-on rotor zero is arbitrary without a CANcoder) and re-applied
+# from the measured range.
+steer_home_current_a: 30.0   # TUNE FIRST — stator current cap during homing.
+                            # Lower = safer/gentler but may not reach the stop;
+                            # higher risks loading the belt/pulleys/column.
+                            # Must stay hand-overpowerable.
+steer_home_duty: 0.07       # sweep speed. TUNE TOGETHER with stall_rps: the
+                            # stall threshold must sit well below the free-
+                            # running rotor velocity at this duty, else the
+                            # sweep reads a false stop as soon as it moves.
+steer_home_stall_rps: 0.15  # |rotor rev/s| below this counts as stalled
+steer_home_stall_s: 3.0     # ...sustained this long = the stop was reached
+steer_home_timeout_s: 30.0  # give up on a sweep after this long (raise if
+                            # you lower steer_home_duty further)
+steer_home_margin_rot: 0.05 # column rotations held back from each stop
+steer_home_right_sign: -1.0 # duty sign that steers RIGHT. Set to -1.0
+                            # 2026-08-03: positive motor rotation is
+                            # physically COUNTER-clockwise (left) on this
+                            # car, so +duty swept LEFT first. Re-verify
+                            # once the rack is coupled.
+                            # first sweep goes left instead
+steer_home_min_half_rot: 0.15
+                            # plausibility floor, COLUMN rotations of
+                            # half-range. A sweep that stalls early gives
+                            # a tiny range; accepting it would ENABLE
+                            # steering that is locked nearly straight.
+                            # Homing is REJECTED below this.
+cancoder_offset_rot: 0.01660  # MEASURED 2026-08-16, wheels dead centre off-ground, post magnet-offset fix
+                            # after cancoder_invert) with the wheels dead centre.
+                            # NOTE: absolute range is +/-0.5 rot, so homing is
+                            # only valid if the car boots within half a column
+                            # turn of centre — park with the wheels straight.
+cancoder_invert: false      # true if the CANcoder counts opposite to the motor
+
+allow_unhomed_steering: false
+# ^ behaviour when the CANcoder is absent/dead at boot:
+#     false -> DRIVE-ONLY mode: the steering motor is never commanded. [safe]
+#     true  -> assume the wheels are centred at boot and steer anyway.
+#              ONLY for bench testing with the wheels centred by hand.
+
+# ── safety ──────────────────────────────────────────────────────────────────
+geometry_measured: true    # GATE: set true ONLY after every MEASURE key above
+                            # has been filled in from the real car. While false
+                            # (or if this file is missing/unreadable) the node
+                            # starts in CONFIG HOLD and never commands motors.
+
+# ── timing ──────────────────────────────────────────────────────────────────
+cmd_timeout_s: 0.25         # /cmd_vel older than this -> enable not fed -> motors
+                            # disable on the Phoenix watchdog within ~100 ms

@@ -1,0 +1,624 @@
+#!/usr/bin/env python3
+"""Ground-plane homography calibration tool for the ethon fusion node.
+
+Computes a 3x3 homography H that maps image pixels (u, v) on the ground
+plane to vehicle-frame ground coordinates (x forward, y left) in metres,
+origin at the rear-axle centre (base_link).
+
+Runs headless on the Jetson over SSH -- no display is ever opened.
+
+Workflow
+--------
+1. Capture a snapshot from the camera you want to calibrate:
+
+       python3 calibrate_homography.py --camera 0        # CSI sensor-id 0
+       python3 calibrate_homography.py --tcp 5001        # perc-1 MJPEG stream
+
+   The frame is saved to /home/jetson/ethon/calib/ and instructions are
+   printed.
+
+2. Lay 4+ markers on the ground at MEASURED (x, y) positions from the
+   rear-axle centre, scp the snapshot to a machine with a display, read
+   off each marker's pixel (u, v), then solve:
+
+       python3 calibrate_homography.py --camera 0 \
+           --solve "u1,v1,x1,y1 u2,v2,x2,y2 u3,v3,x3,y3 u4,v4,x4,y4"
+
+   The tool prints per-point reprojection error in metres and saves H
+   only if the mean error is within tolerance.
+
+3. Sanity-check a saved H by projecting a pixel:
+
+       python3 calibrate_homography.py --camera 0 --test "640,500"
+"""
+
+import argparse
+import glob
+import json
+import os
+import socket
+import struct
+import sys
+
+import cv2
+import numpy as np
+
+# --------------------------------------------------------------------------
+# Constants
+# --------------------------------------------------------------------------
+CALIB_DIR = "/home/jetson/ethon/calib"
+
+# CSI capture (nvarguscamerasrc)
+CSI_WIDTH = 1280
+CSI_HEIGHT = 720
+CSI_FPS = 30
+CSI_WARMUP_FRAMES = 15          # frames discarded while auto-exposure settles
+
+# perc-1 TCP MJPEG sources (4-byte big-endian length prefix + JPEG payload)
+PERC1_HOSTS = ("192.168.0.101", "100.86.169.68")   # LAN first, then Tailscale
+TCP_VALID_PORTS = (5001, 5002)                     # 5001 OV5647, 5002 IMX708
+TCP_TIMEOUT_S = 5.0
+TCP_WARMUP_FRAMES = 2           # frames discarded before keeping one
+TCP_MAX_JPEG_BYTES = 20 * 1024 * 1024              # sanity bound on frame size
+
+# Homography solve
+MIN_POINTS = 4
+MAX_MEAN_ERR_M = 0.25           # refuse to save H above this mean reprojection error
+RANSAC_THRESH_M = 0.25          # RANSAC inlier threshold (used when >4 points)
+HORIZON_W_EPS = 1e-6            # |w| below this => pixel maps to/near the horizon
+
+# Suggested ground-marker pattern (x forward, y left), metres from rear axle
+SUGGESTED_PATTERN = ((3.0, 0.0), (6.0, 0.0), (3.0, 1.5), (6.0, -1.5))
+
+
+# --------------------------------------------------------------------------
+# Paths / naming
+# --------------------------------------------------------------------------
+def source_key(camera, tcp):
+    """Filename stem for this source: 'cam0' (CSI) or 'cam_tcp5001' (perc-1).
+
+    Must match birdseye_fusion.py SourceSpec.h_file exactly.
+    """
+    if camera is not None:
+        return "cam%d" % camera
+    return "cam_tcp%d" % tcp
+
+
+def snapshot_path(key):
+    return os.path.join(CALIB_DIR, "%s_snapshot.jpg" % key)
+
+
+def homography_path(key):
+    return os.path.join(CALIB_DIR, "%s_H.npy" % key)
+
+
+def meta_path(key):
+    """Records which space H lives in. Read by birdseye_fusion."""
+    return os.path.join(CALIB_DIR, "%s_H.json" % key)
+
+
+def intrinsics_path(key):
+    return os.path.join(CALIB_DIR, "%s_fisheye.npz" % key)
+
+
+def shot_path(key, n):
+    return os.path.join(CALIB_DIR, "%s_cb_%02d.jpg" % (key, n))
+
+
+# --------------------------------------------------------------------------
+# Fisheye intrinsics
+# --------------------------------------------------------------------------
+# A homography assumes a pinhole camera. On a strongly distorting lens (the HQ
+# wide is 184.6 deg diagonal) that assumption breaks down badly off-axis, so
+# detection points must be undistorted into normalised pinhole coordinates
+# BEFORE H is fitted or applied. These must stay in lockstep, which is why
+# solving writes a sidecar recording the choice.
+UNDISTORT_MAX_NORM = 5.0        # keep identical to birdseye_fusion.py
+
+
+def load_intrinsics(key):
+    """Return (K, D) for the source, or None if never calibrated."""
+    p = intrinsics_path(key)
+    if not os.path.exists(p):
+        return None
+    try:
+        z = np.load(p)
+        return z["K"], z["D"]
+    except (OSError, ValueError, KeyError) as exc:
+        print("[intrinsics] %s unreadable: %s" % (p, exc), flush=True)
+        return None
+
+
+def undistort_points_fisheye(pix, K, D):
+    """Fisheye pixels -> normalised pinhole coords; NaN where unrepresentable."""
+    pts = np.asarray(pix, dtype=np.float64).reshape(-1, 1, 2)
+    und = cv2.fisheye.undistortPoints(pts, K, D).reshape(-1, 2)
+    bad = ~np.isfinite(und).all(axis=1) | (
+        np.abs(und) > UNDISTORT_MAX_NORM).any(axis=1)
+    und[bad] = np.nan
+    return und
+
+
+def do_calib_intrinsics(args, key):
+    """Solve fisheye K/D from the captured checkerboard shots."""
+    cols, rows = (int(v) for v in args.pattern.lower().split("x"))
+    files = sorted(glob.glob(os.path.join(CALIB_DIR, "%s_cb_*.jpg" % key)))
+    if len(files) < 8:
+        print("[intrinsics] found %d shot(s); need at least 8 (12-20 is "
+              "better). Capture more with --shot." % len(files), flush=True)
+        sys.exit(1)
+    objp = np.zeros((1, cols * rows, 3), np.float64)
+    objp[0, :, :2] = np.mgrid[0:cols, 0:rows].T.reshape(-1, 2) * args.square
+    objpoints, imgpoints, size, used = [], [], None, []
+    flags = (cv2.CALIB_CB_ADAPTIVE_THRESH | cv2.CALIB_CB_NORMALIZE_IMAGE
+             | cv2.CALIB_CB_FAST_CHECK)
+    for f in files:
+        img = cv2.imread(f)
+        if img is None:
+            continue
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        size = gray.shape[::-1]
+        ok, corners = cv2.findChessboardCorners(gray, (cols, rows), flags)
+        if not ok:
+            print("  no pattern: %s" % os.path.basename(f), flush=True)
+            continue
+        cv2.cornerSubPix(
+            gray, corners, (3, 3), (-1, -1),
+            (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.1))
+        objpoints.append(objp)
+        imgpoints.append(corners.reshape(1, -1, 2).astype(np.float64))
+        used.append(os.path.basename(f))
+    print("[intrinsics] pattern found in %d/%d shots"
+          % (len(used), len(files)), flush=True)
+    if len(objpoints) < 8:
+        print("[intrinsics] FAILED: too few usable shots. Fill the frame at "
+              "varied angles and distances, including the CORNERS — that is "
+              "where the distortion lives.", flush=True)
+        sys.exit(1)
+    K = np.zeros((3, 3))
+    D = np.zeros((4, 1))
+    try:
+        rms, K, D, _, _ = cv2.fisheye.calibrate(
+            objpoints, imgpoints, size, K, D,
+            flags=(cv2.fisheye.CALIB_RECOMPUTE_EXTRINSIC
+                   | cv2.fisheye.CALIB_FIX_SKEW),
+            criteria=(cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER,
+                      50, 1e-6))
+    except cv2.error as exc:
+        print("[intrinsics] FAILED: %s\n  Usually means a bad shot slipped "
+              "in. Delete blurry/partial ones and retry." % exc, flush=True)
+        sys.exit(1)
+    print("[intrinsics] RMS reprojection error: %.4f px" % rms, flush=True)
+    if rms > 1.5:
+        print("[intrinsics] WARNING: rms > 1.5 px is poor. More varied "
+              "angles, and make sure the board is FLAT.", flush=True)
+    os.makedirs(CALIB_DIR, exist_ok=True)
+    np.savez(intrinsics_path(key), K=K, D=D, rms=np.array([rms]),
+             image_size=np.array(size))
+    print("[intrinsics] saved %s" % intrinsics_path(key), flush=True)
+    print("[intrinsics] fx=%.1f fy=%.1f cx=%.1f cy=%.1f"
+          % (K[0, 0], K[1, 1], K[0, 2], K[1, 2]), flush=True)
+    print("[intrinsics] NOW RE-RUN --solve: H must be refitted in the "
+          "undistorted space.", flush=True)
+
+
+# --------------------------------------------------------------------------
+# Frame capture
+# --------------------------------------------------------------------------
+def capture_csi(sensor_id):
+    """Grab one settled frame from a Jetson CSI camera via nvarguscamerasrc.
+
+    Returns a BGR numpy array or raises RuntimeError.
+    """
+    pipeline = (
+        "nvarguscamerasrc sensor-id=%d ! "
+        "video/x-raw(memory:NVMM), width=%d, height=%d, framerate=%d/1 ! "
+        "nvvidconv ! video/x-raw, format=BGRx ! "
+        "videoconvert ! video/x-raw, format=BGR ! "
+        "appsink drop=true max-buffers=1"
+        % (sensor_id, CSI_WIDTH, CSI_HEIGHT, CSI_FPS)
+    )
+    print("[capture] opening CSI sensor-id %d ..." % sensor_id, flush=True)
+    cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
+    if not cap.isOpened():
+        raise RuntimeError(
+            "could not open nvarguscamerasrc sensor-id=%d "
+            "(is another process using the camera?)" % sensor_id
+        )
+    try:
+        frame = None
+        # Discard warm-up frames so auto-exposure / AWB settle, keep the last.
+        for _ in range(CSI_WARMUP_FRAMES + 1):
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                raise RuntimeError("CSI read failed on sensor-id %d" % sensor_id)
+        return frame
+    finally:
+        cap.release()
+
+
+def _recv_exact(sock, n):
+    """Read exactly n bytes from a socket or raise RuntimeError."""
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise RuntimeError("TCP stream closed mid-frame")
+        buf.extend(chunk)
+    return bytes(buf)
+
+
+def capture_tcp(port, host=None):
+    """Grab one frame from a perc-1 length-prefixed MJPEG TCP stream.
+
+    Protocol: 4-byte big-endian payload size ('>I') followed by JPEG bytes.
+    Tries PERC1_HOSTS in order unless an explicit host is given.
+    Returns a BGR numpy array or raises RuntimeError.
+    """
+    hosts = (host,) if host else PERC1_HOSTS
+    last_err = None
+    for h in hosts:
+        print("[capture] connecting to %s:%d ..." % (h, port), flush=True)
+        try:
+            with socket.create_connection((h, port), timeout=TCP_TIMEOUT_S) as sock:
+                sock.settimeout(TCP_TIMEOUT_S)
+                frame = None
+                # Skip a couple of frames, then keep the next full one.
+                for _ in range(TCP_WARMUP_FRAMES + 1):
+                    (size,) = struct.unpack(">I", _recv_exact(sock, 4))
+                    if size == 0 or size > TCP_MAX_JPEG_BYTES:
+                        raise RuntimeError(
+                            "implausible frame size %d bytes -- protocol desync?" % size
+                        )
+                    jpeg = _recv_exact(sock, size)
+                    frame = cv2.imdecode(
+                        np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR
+                    )
+                    if frame is None:
+                        raise RuntimeError("JPEG decode failed (corrupt frame)")
+                return frame
+        except (OSError, RuntimeError) as exc:
+            print("[capture] %s:%d failed: %s" % (h, port, exc), flush=True)
+            last_err = exc
+    raise RuntimeError("could not get a frame from port %d on any host: %s"
+                       % (port, last_err))
+
+
+# --------------------------------------------------------------------------
+# Geometry
+# --------------------------------------------------------------------------
+def project_pixels(H, pixels):
+    """Apply homography H to an (N, 2) array of pixels -> (N, 2) ground metres.
+
+    Raises RuntimeError if any pixel maps to (or past) the horizon.
+    """
+    pts = np.asarray(pixels, dtype=np.float64).reshape(-1, 2)
+    homog = np.hstack([pts, np.ones((pts.shape[0], 1))])     # (N, 3)
+    mapped = (H @ homog.T).T                                 # (N, 3)
+    w = mapped[:, 2]
+    if np.any(np.abs(w) < HORIZON_W_EPS):
+        raise RuntimeError(
+            "pixel maps to the horizon (w ~ 0) -- it is not on the ground plane"
+        )
+    return mapped[:, :2] / w[:, None]
+
+
+def parse_solve_string(text):
+    """Parse 'u,v,x,y u,v,x,y ...' into (pixels Nx2, ground Nx2) float arrays."""
+    pixels, ground = [], []
+    tokens = text.split()
+    for i, tok in enumerate(tokens):
+        parts = tok.split(",")
+        if len(parts) != 4:
+            raise ValueError(
+                "point %d ('%s') must be exactly 'u,v,x,y' (4 comma-separated numbers)"
+                % (i + 1, tok)
+            )
+        try:
+            u, v, x, y = (float(p) for p in parts)
+        except ValueError:
+            raise ValueError("point %d ('%s') contains a non-numeric value" % (i + 1, tok))
+        pixels.append((u, v))
+        ground.append((x, y))
+    if len(pixels) < MIN_POINTS:
+        raise ValueError("need at least %d points, got %d" % (MIN_POINTS, len(pixels)))
+    pix = np.asarray(pixels, dtype=np.float64)
+    gnd = np.asarray(ground, dtype=np.float64)
+    # Degenerate-layout check: ground points must not be collinear.
+    centered = gnd - gnd.mean(axis=0)
+    if np.linalg.matrix_rank(centered, tol=1e-3) < 2:
+        raise ValueError(
+            "ground points are collinear -- spread markers in both x and y "
+            "(e.g. %s)" % format_pattern()
+        )
+    return pix, gnd
+
+
+def format_pattern():
+    return ", ".join("(%.1f, %.1f)" % p for p in SUGGESTED_PATTERN)
+
+
+# --------------------------------------------------------------------------
+# Modes
+# --------------------------------------------------------------------------
+def do_shot(args, key):
+    """Grab one numbered checkerboard frame for the intrinsics solve."""
+    frame = (capture_csi(args.camera) if args.camera is not None
+             else capture_tcp(args.tcp, host=args.host))
+    os.makedirs(CALIB_DIR, exist_ok=True)
+    existing = sorted(glob.glob(os.path.join(CALIB_DIR, "%s_cb_*.jpg" % key)))
+    n = len(existing)
+    path = shot_path(key, n)
+    if not cv2.imwrite(path, frame):
+        raise RuntimeError("failed to write %s" % path)
+    cols, rows = (int(v) for v in args.pattern.lower().split("x"))
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    found, _ = cv2.findChessboardCorners(
+        gray, (cols, rows),
+        cv2.CALIB_CB_ADAPTIVE_THRESH | cv2.CALIB_CB_NORMALIZE_IMAGE)
+    print("[shot] saved %s  (%s %dx%d pattern)"
+          % (path, "FOUND" if found else "no", cols, rows), flush=True)
+    print("[shot] %d shot(s) so far; 12-20 recommended." % (n + 1), flush=True)
+    if not found:
+        print("[shot] pattern not detected — this one will be skipped. Fill "
+              "more of the frame and keep the board flat and unblurred.",
+              flush=True)
+    print("[shot] vary angle/distance and cover the CORNERS of the frame, "
+          "that is where the distortion is. Then: --calib-intrinsics",
+          flush=True)
+
+
+def do_capture(args, key):
+    """Capture one frame, save the snapshot, print marker/solve instructions."""
+    if args.camera is not None:
+        frame = capture_csi(args.camera)
+    else:
+        frame = capture_tcp(args.tcp, host=args.host)
+
+    os.makedirs(CALIB_DIR, exist_ok=True)
+    snap = snapshot_path(key)
+    if not cv2.imwrite(snap, frame):
+        raise RuntimeError("failed to write %s" % snap)
+
+    h, w = frame.shape[:2]
+    src_flag = ("--camera %d" % args.camera) if args.camera is not None \
+        else ("--tcp %d" % args.tcp)
+    print("", flush=True)
+    print("[capture] saved %dx%d snapshot: %s" % (w, h, snap), flush=True)
+    print("""
+NEXT STEPS
+==========
+1. Lay 4 or more flat markers (tape crosses, chalk dots) on the ground in
+   the camera's view. MEASURE each marker's position from the REAR-AXLE
+   CENTRE with a tape measure:
+       x = metres FORWARD of the rear axle
+       y = metres LEFT of centreline (right side is NEGATIVE)
+   Suggested pattern (metres): %s
+
+2. Copy the snapshot to a machine with a display and read off each
+   marker's pixel coordinates (u = column from left, v = row from top),
+   e.g. with GIMP, Preview, or Paint:
+       scp jetson@<jetson-ip>:%s .
+
+3. Solve and save the homography (any number of points >= %d):
+       python3 calibrate_homography.py %s --solve \\
+           "u1,v1,x1,y1 u2,v2,x2,y2 u3,v3,x3,y3 u4,v4,x4,y4"
+
+   Example for the suggested pattern (replace u,v with YOUR pixel reads):
+       python3 calibrate_homography.py %s --solve \\
+           "640,580,3.0,0.0 652,470,6.0,0.0 410,560,3.0,1.5 885,468,6.0,-1.5"
+
+Tips: keep markers >= 2 m apart, cover both near and far field, and make
+sure the vehicle does not move between capture and measurement.
+""" % (format_pattern(), snap, MIN_POINTS, src_flag, src_flag), flush=True)
+
+
+def do_solve(args, key):
+    """Compute H from pixel<->ground pairs, validate, and save."""
+    pixels, ground = parse_solve_string(args.solve)
+    n = len(pixels)
+    print("[solve] %d correspondence points" % n, flush=True)
+
+    # If this source has fisheye intrinsics, fit H in UNDISTORTED space —
+    # otherwise the projective model is fighting the lens and only holds near
+    # the image centre. birdseye_fusion reads the sidecar written below and
+    # undistorts detections the same way.
+    kd = load_intrinsics(key)
+    undistort = kd is not None
+    if undistort:
+        und = undistort_points_fisheye(pixels, kd[0], kd[1])
+        if not np.isfinite(und).all():
+            bad = [i for i, p in enumerate(und) if not np.isfinite(p).all()]
+            print("[solve] FAILED: point(s) %s sit too far off-axis to "
+                  "undistort (>%.0f normalised, ~79 deg). Use markers closer "
+                  "to the image centre." % (bad, UNDISTORT_MAX_NORM),
+                  flush=True)
+            sys.exit(1)
+        print("[solve] fisheye intrinsics found — fitting H in undistorted "
+              "space", flush=True)
+        pixels = und
+    else:
+        print("[solve] no fisheye intrinsics for %s — fitting H on RAW "
+              "pixels. Fine for a rectilinear lens; on a wide/fisheye lens "
+              "run --calib-intrinsics first or positions will be wrong "
+              "off-centre." % key, flush=True)
+
+    method = cv2.RANSAC if n > MIN_POINTS else 0
+    H, mask = cv2.findHomography(
+        pixels.reshape(-1, 1, 2), ground.reshape(-1, 1, 2),
+        method=method, ransacReprojThreshold=RANSAC_THRESH_M,
+    )
+    if H is None:
+        print("[solve] FAILED: cv2.findHomography returned no solution. "
+              "Check for duplicated or degenerate points.", flush=True)
+        sys.exit(1)
+    inliers = (mask.ravel().astype(bool) if mask is not None
+               else np.ones(n, dtype=bool))
+
+    projected = project_pixels(H, pixels)
+    errors = np.linalg.norm(projected - ground, axis=1)
+
+    print("", flush=True)
+    print("  #   pixel (u, v)      measured (x, y)    projected (x, y)    err [m]",
+          flush=True)
+    for i in range(n):
+        flag = "" if inliers[i] else "   << RANSAC OUTLIER"
+        print("  %-3d (%6.1f,%6.1f)  (%6.2f,%6.2f)    (%6.2f,%6.2f)    %.3f%s"
+              % (i + 1, pixels[i, 0], pixels[i, 1], ground[i, 0], ground[i, 1],
+                 projected[i, 0], projected[i, 1], errors[i], flag), flush=True)
+
+    mean_err = float(errors.mean())
+    max_err = float(errors.max())
+    print("", flush=True)
+    print("[solve] mean error %.3f m, max error %.3f m (limit: mean <= %.2f m)"
+          % (mean_err, max_err, MAX_MEAN_ERR_M), flush=True)
+
+    if mean_err > MAX_MEAN_ERR_M:
+        print("[solve] REFUSING TO SAVE: mean reprojection error %.3f m exceeds "
+              "%.2f m." % (mean_err, MAX_MEAN_ERR_M), flush=True)
+        print("[solve] Re-check pixel reads (u is column, v is row), tape "
+              "measurements, and that all markers lie flat on the ground.",
+              flush=True)
+        sys.exit(1)
+
+    os.makedirs(CALIB_DIR, exist_ok=True)
+    out = homography_path(key)
+    np.save(out, H.astype(np.float64))
+    # Sidecar: tells birdseye_fusion which space this H expects. Written
+    # every solve (including the raw-pixel case) so a stale file can never
+    # leave the two ends disagreeing.
+    with open(meta_path(key), "w") as f:
+        json.dump({"undistort": bool(undistort),
+                   "model": "fisheye" if undistort else "none",
+                   "points": int(n)}, f, indent=1)
+    print("[solve] saved homography: %s" % out, flush=True)
+    print("[solve] saved %s (undistort=%s)"
+          % (meta_path(key), undistort), flush=True)
+    print("[solve] H =", flush=True)
+    for row in H:
+        print("        [%12.6e %12.6e %12.6e]" % tuple(row), flush=True)
+    print("[solve] sanity check it now, e.g.:", flush=True)
+    print("        python3 calibrate_homography.py %s --test \"%d,%d\""
+          % (("--camera %d" % args.camera) if args.camera is not None
+             else ("--tcp %d" % args.tcp),
+             int(pixels[0, 0]), int(pixels[0, 1])), flush=True)
+
+
+def do_test(args, key):
+    """Load a saved H and project a single pixel to ground coordinates."""
+    path = homography_path(key)
+    if not os.path.isfile(path):
+        print("[test] no homography found at %s -- run --solve first." % path,
+              flush=True)
+        sys.exit(1)
+    H = np.load(path)
+    if H.shape != (3, 3):
+        print("[test] %s is not a 3x3 matrix (shape %s) -- re-run --solve."
+              % (path, H.shape), flush=True)
+        sys.exit(1)
+
+    parts = args.test.split(",")
+    if len(parts) != 2:
+        print("[test] --test expects 'u,v' (got '%s')" % args.test, flush=True)
+        sys.exit(1)
+    try:
+        u, v = float(parts[0]), float(parts[1])
+    except ValueError:
+        print("[test] --test expects two numbers 'u,v' (got '%s')" % args.test,
+              flush=True)
+        sys.exit(1)
+
+    try:
+        # --test takes a RAW pixel, so undistort exactly as fusion will
+        # before applying H — otherwise the sanity check silently tests a
+        # different pipeline than the one that runs on the car.
+        pt = (u, v)
+        kd = load_intrinsics(key)
+        if kd is not None:
+            und = undistort_points_fisheye([pt], kd[0], kd[1])[0]
+            if not np.isfinite(und).all():
+                print("[test] pixel is too far off-axis to undistort "
+                      "(>%.0f normalised) — fusion would DROP this "
+                      "detection." % UNDISTORT_MAX_NORM, flush=True)
+                sys.exit(1)
+            print("[test] undistorted to normalised (%.4f, %.4f)"
+                  % (und[0], und[1]), flush=True)
+            pt = (float(und[0]), float(und[1]))
+        xy = project_pixels(H, [pt])[0]
+    except RuntimeError as exc:
+        print("[test] pixel (%.1f, %.1f): %s" % (u, v, exc), flush=True)
+        sys.exit(1)
+
+    x, y = float(xy[0]), float(xy[1])
+    rng = float(np.hypot(x, y))
+    print("[test] H file : %s" % path, flush=True)
+    print("[test] pixel  : (u=%.1f, v=%.1f)" % (u, v), flush=True)
+    print("[test] ground : x=%.2f m forward, y=%.2f m %s of centreline "
+          "(range %.2f m from rear axle)"
+          % (x, abs(y), "left" if y >= 0.0 else "right", rng), flush=True)
+    if x < 0.0:
+        print("[test] WARNING: point is BEHIND the rear axle -- if the pixel "
+              "is clearly in front of the car, the calibration is wrong.",
+              flush=True)
+
+
+# --------------------------------------------------------------------------
+# Entry point
+# --------------------------------------------------------------------------
+def build_parser():
+    parser = argparse.ArgumentParser(
+        description="Ground-plane homography calibration (headless). "
+                    "Default action with no --solve/--test: capture a snapshot.",
+        epilog="Outputs live in %s as <src>_snapshot.jpg and <src>_H.npy, "
+               "where <src> is camN or tcpPORT." % CALIB_DIR,
+    )
+    src = parser.add_mutually_exclusive_group(required=True)
+    src.add_argument("--camera", type=int, metavar="N",
+                     help="Jetson CSI sensor-id (0 = IMX477 front, 1 = IMX219 right)")
+    src.add_argument("--tcp", type=int, metavar="PORT", choices=TCP_VALID_PORTS,
+                     help="perc-1 MJPEG TCP port (5001 = OV5647, 5002 = IMX708)")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--solve", metavar='"u,v,x,y ..."',
+                      help="space-separated u,v,x,y correspondences "
+                           "(pixels and metres, >= %d points)" % MIN_POINTS)
+    mode.add_argument("--test", metavar='"u,v"',
+                      help="project one pixel through the saved H")
+    mode.add_argument("--shot", action="store_true",
+                      help="capture one numbered checkerboard shot for "
+                           "fisheye intrinsics (repeat 12-20 times)")
+    mode.add_argument("--calib-intrinsics", action="store_true",
+                      dest="calib_intrinsics",
+                      help="solve fisheye K/D from the captured shots, then "
+                           "re-run --solve")
+    parser.add_argument("--pattern", default="9x6", metavar="COLSxROWS",
+                        help="checkerboard INNER corners (default 9x6)")
+    parser.add_argument("--square", type=float, default=0.025, metavar="M",
+                        help="checkerboard square size in metres "
+                             "(default 0.025)")
+    parser.add_argument("--host", default=None, metavar="IP",
+                        help="override perc-1 host for --tcp capture "
+                             "(default: try %s)" % ", ".join(PERC1_HOSTS))
+    return parser
+
+
+def main():
+    args = build_parser().parse_args()
+    key = source_key(args.camera, args.tcp)
+    try:
+        if args.solve is not None:
+            do_solve(args, key)
+        elif args.test is not None:
+            do_test(args, key)
+        elif args.calib_intrinsics:
+            do_calib_intrinsics(args, key)
+        elif args.shot:
+            do_shot(args, key)
+        else:
+            do_capture(args, key)
+    except (RuntimeError, ValueError) as exc:
+        print("[error] %s" % exc, flush=True)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

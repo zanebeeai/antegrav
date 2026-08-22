@@ -1,0 +1,78 @@
+"""Accelerator pedal firmware -- Seeed XIAO RP2040, CircuitPython.
+
+Reads the pedal potentiometer on A0 and streams normalised position (0.0 =
+released, 1.0 = floored) over USB serial as plain ASCII, one line per sample:
+
+    0.000\n
+    0.734\n
+    ...
+
+Deliberately NOT the wheel hub's framed multi-channel protocol (SOF/CRC8/
+channel routing) -- that exists to multiplex Nextion + LED + button traffic
+over one link. This is a single scalar value on its own dedicated USB CDC
+port, so a plain newline-delimited stream is simpler and easier to debug
+(readable directly from a serial terminal) with nothing to gain from framing.
+
+ethon_drive.py on the Jetson reads this directly (see PEDAL_PORT /
+_pedal_pump in ethon_drive.py) -- there is no intermediate bridge process.
+Low latency matters here: this is a throttle input.
+
+Wiring: pedal potentiometer wiper -> A0, outer legs -> 3V3 and GND. A0 is
+XIAO RP2040's GPIO26 (ADC0) -- NOT GPIO18, which is a plain digital pin and
+cannot read an analog voltage on this board. Only A0/A1/A2 (GPIO26/27/28)
+have ADC on the XIAO RP2040.
+
+If the pedal reads backwards (1.0 at rest, 0.0 floored), swap PEDAL_MIN and
+PEDAL_MAX below rather than rewiring.
+"""
+
+import time
+
+import analogio
+import board
+
+# ── calibration -- MEASURED 2026-08-17 on the actual pedal ─────────────────
+# Raw analogio.AnalogIn.value is 16-bit (0-65535) regardless of the RP2040's
+# native 12-bit ADC resolution; CircuitPython scales it up internally.
+# Pedal's real electrical range is 0.26-1.0 of full scale, not 0.0-1.0 --
+# the potentiometer's mechanical travel doesn't sweep its full resistance.
+PEDAL_MIN = 17089        # raw reading at fully RELEASED (0.26 * 65535)
+PEDAL_MAX = 65535        # raw reading at fully FLOORED  (1.00 * 65535)
+DEADBAND_LOW = 0.02      # normalised position below this reports as exactly 0.0
+                          # -- pots don't rest at a perfectly repeatable raw
+                          # value, and a throttle that reads 0.01 at rest would
+                          # creep the car. Zero must mean zero.
+
+SAMPLE_HZ = 100.0
+SMOOTH_ALPHA = 0.08      # exponential smoothing -- raw ADC is noisy enough
+                          # that an unsmoothed throttle feels twitchy.
+                          # Started at 0.3; raised to 0.08 (heavier filtering)
+                          # 2026-08-18 after real-world testing showed
+                          # noise-driven jitter reaching the drive motors as
+                          # rapid accel/regen alternation. Trades a little
+                          # response lag for a controllable throttle.
+
+
+def _clamp01(x):
+    return 0.0 if x < 0.0 else 1.0 if x > 1.0 else x
+
+
+pedal = analogio.AnalogIn(board.A0)
+smoothed = 0.0
+period = 1.0 / SAMPLE_HZ
+
+while True:
+    t0 = time.monotonic()
+
+    raw = pedal.value
+    frac = _clamp01((raw - PEDAL_MIN) / (PEDAL_MAX - PEDAL_MIN))
+    if frac < DEADBAND_LOW:
+        frac = 0.0
+
+    smoothed += SMOOTH_ALPHA * (frac - smoothed)
+
+    print("%.3f" % smoothed)
+
+    dt = time.monotonic() - t0
+    if dt < period:
+        time.sleep(period - dt)

@@ -1,0 +1,15 @@
+[Unit]
+Description=Ethon drive controller (Krakens via Phoenix6 on can0)
+After=ethon-can.service network.target
+Requires=ethon-can.service
+
+[Service]
+Type=simple
+User=jetson
+WorkingDirectory=/home/jetson/ethon
+ExecStart=/bin/bash -lc 'source /opt/ros/humble/setup.bash && exec python3 /home/jetson/ethon/ethon_drive.py'
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

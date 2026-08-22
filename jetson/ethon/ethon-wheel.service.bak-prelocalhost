@@ -1,0 +1,35 @@
+# ethon-wheel.service — steering-wheel bridge (Jetson <-> Pico hub over USB)
+#
+# Supersedes ethon-hmi.service AND ethon-leds.service: the Nextion display, the
+# NeoPixel lights, and the wheel buttons all now hang off the Pico, and this one
+# node bridges them to ROS. Runs ALWAYS (capture + autonomy) — it owns only the
+# USB link to the Pico, no CSI cameras or CAN, so no Conflicts=.
+#
+# Cutover from the old direct-to-Jetson HMI:
+#     sudo systemctl disable --now ethon-hmi ethon-leds 2>/dev/null
+#     sudo cp /home/jetson/ethon/ethon-wheel.service /etc/systemd/system/
+#     sudo cp /home/jetson/ethon/99-ethon-usb.rules /etc/udev/rules.d/
+#     sudo udevadm control --reload && sudo udevadm trigger
+#     sudo systemctl daemon-reload && sudo systemctl enable --now ethon-wheel
+#
+# The mode button still needs the existing /etc/sudoers.d/ethon-hmi drop-in
+# (it authorises the jetson user to run ethon_set_mode.sh, regardless of caller).
+
+[Unit]
+Description=Ethon steering-wheel bridge (Nextion + LEDs + buttons via Pico)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=jetson
+WorkingDirectory=/home/jetson/ethon
+ExecStart=/bin/bash -lc 'source /opt/ros/humble/setup.bash && export ROS_DOMAIN_ID=42 RMW_IMPLEMENTATION=rmw_cyclonedds_cpp && exec python3 /home/jetson/ethon/wheel_bridge.py'
+Restart=on-failure
+RestartSec=5
+# SIGINT so rclpy shuts down cleanly (writes "HMI offline", lights off)
+KillSignal=SIGINT
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

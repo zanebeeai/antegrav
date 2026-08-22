@@ -1,0 +1,14 @@
+# Generated Python files
+__pycache__/
+*.py[cod]
+
+# Runtime data retained on the Jetson
+capture_data/
+logs/
+
+# Generated model artifacts are too large for normal Git storage. Keep the
+# human-readable artifact notes and checksum manifest.
+models/*
+!models/README.md
+!models/REMOTE_MANIFEST.sha256
+

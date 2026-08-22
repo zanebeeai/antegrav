@@ -1,0 +1,443 @@
+# code.py — Ethon steering-wheel I/O hub (Raspberry Pi Pico / RP2040, CircuitPython)
+#
+# One Pico mounted on the steering wheel owns all the wheel electronics and talks
+# to the Jetson over a single USB cable. It does three jobs:
+#
+#   1. NeoPixels (WS2812) on a GPIO via PIO  — rear brake/tail + front DRL.
+#      RP2040 PIO gives rock-solid WS2812 timing that the Jetson's Linux GPIO
+#      cannot. The Jetson sends a brake level (0..255) + flags; the Pico does the
+#      smoothing/flashing locally at 60 fps, so the lights stay alive even if the
+#      USB link stalls.
+#   2. Nextion display — TRANSPARENT bridge. Bytes the Jetson's HMI node draws are
+#      forwarded out the Nextion UART; touch bytes from the panel are forwarded
+#      back. All the dashboard logic stays on the Jetson (wheel_bridge.py); this
+#      Pico never parses the display content.
+#   3. Wheel buttons (+ optional rotary encoder) — debounced here, sent up as
+#      ASCII tokens (arm/disarm/estop/mark/mode/enc+/enc-).
+#
+# Link protocol (framed, binary-safe, same on both ends):
+#   A5 5A | ch(1) | len(2 BE) | payload(len) | crc8(1)
+#   ch 0x01 NEXTION  both ways  payload = raw Nextion bytes
+#   ch 0x02 LED      Jetson->Pico  payload = brake, estop, armed, front  (4 bytes)
+#   ch 0x03 BUTTON   Pico->Jetson  payload = ASCII token
+#   ch 0x04 LOG      Pico->Jetson  payload = ASCII debug text
+#   crc8: poly 0x07, init 0x00, over ch||lenHi||lenLo||payload
+#
+# DEPLOY (CircuitPython):
+#   1. Flash CircuitPython UF2 for the Pico once (hold BOOTSEL, drag the .uf2).
+#   2. Copy the Adafruit 'neopixel.mpy' into CIRCUITPY/lib/ (from the matching
+#      CircuitPython library bundle). keypad/rotaryio/busio/usb_cdc are built in.
+#   3. Copy boot.py and this code.py to the CIRCUITPY root. Replug the Pico.
+#
+# WIRING (edit the PIN MAP below to match):
+#   NeoPixel DIN <- GP2 (via ~330 ohm), strip on its own 5 V, common ground.
+#   Nextion: Pico GP0 (TX) -> Nextion RX,  Pico GP1 (RX) <- Nextion TX, common GND.
+#   Buttons: each pin to GND when pressed (internal pull-ups used).
+
+import time
+
+import board
+import busio
+import digitalio
+import usb_cdc
+
+# neopixel/keypad/rotaryio are optional at import so the hub still runs if a
+# library or a peripheral is missing — each feature self-disables with a log.
+try:
+    import neopixel
+except ImportError:
+    neopixel = None
+try:
+    import keypad
+except ImportError:
+    keypad = None
+try:
+    import rotaryio
+except ImportError:
+    rotaryio = None
+
+# ── PIN MAP / CONFIG (edit to match the wheel wiring) ───────────────────────
+NEOPIXEL_PIN = board.GP22   # moved off GP2 (GP2 now free for encoder 3 channel)
+NEX_TX_PIN, NEX_RX_PIN = board.GP0, board.GP1   # to Nextion RX / from Nextion TX
+NEX_BAUD = 9600                                  # match the panel (stock = 9600)
+
+# Buttons: pin -> token sent to the Jetson. Active-low (pressed = to GND).
+BUTTON_MAP = {
+    board.GP5: "arm",
+    board.GP17: "disarm",
+    board.GP6: "estop",
+    board.GP16: "mark",
+    board.GP13: "mode",      # toggle capture<->autonomy
+}
+# Rotary encoder "R": GP12/GP10 = A/B direction channels (GP11 = push button,
+# currently unused). Sends enc+/enc- per detent -> wheel_bridge adjusts target speed.
+ENCODER_A, ENCODER_B = board.GP12, board.GP10
+# Rotary encoder 3: GP4/GP2 = A/B (GP3 = push button, unused). Sends e3+/e3-
+# per detent -> wheel_bridge adjusts drive regen (e-brake) strength.
+ENCODER3_A, ENCODER3_B = board.GP4, board.GP2
+# Rotary encoder 2: GP18/GP20 = A/B (GP19 = push button, unused). Sends
+# e2+/e2- per detent -> wheel_bridge debug speed setpoint (bench testing).
+ENCODER2_A, ENCODER2_B = board.GP18, board.GP20
+
+# LED strip layout (the Pico owns the strip, so counts live here).
+N_REAR = 51            # rear brake/tail LEDs, strip indices 0..N_REAR-1
+N_FRONT = 0            # forward DRL LEDs (set to your count; 0 = none)
+REAR_FIRST = True
+MAX_BRIGHT = 0.60      # global ceiling (current + eye safety)
+TAIL_LEVEL = 0.14      # rear running-light fraction
+FRONT_LEVEL = 0.45     # forward DRL white fraction
+ATTACK, RELEASE = 0.85, 0.20   # brake rise/fall smoothing
+FLASH_HZ = 2.5
+LED_FPS = 60.0
+
+# ── link framing ────────────────────────────────────────────────────────────
+SOF = b"\xA5\x5A"
+CH_NEXTION, CH_LED, CH_BUTTON, CH_LOG = 1, 2, 3, 4
+
+
+def crc8(data):
+    crc = 0
+    for b in data:
+        crc ^= b
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0x07) & 0xFF if (crc & 0x80) else (crc << 1) & 0xFF
+    return crc
+
+
+class Link:
+    """Framed multiplexed link over the USB-CDC data endpoint."""
+
+    def __init__(self, port):
+        self._p = port
+        self._rx = bytearray()
+
+    def send(self, ch, payload):
+        if self._p is None:
+            return
+        n = len(payload)
+        body = bytes((ch, (n >> 8) & 0xFF, n & 0xFF)) + bytes(payload)
+        try:
+            self._p.write(SOF + body + bytes((crc8(body),)))
+        except Exception:
+            pass
+
+    def log(self, text):
+        self.send(CH_LOG, text.encode("ascii", "ignore"))
+
+    def poll(self):
+        """Return a list of (ch, payload) frames received since last call."""
+        if self._p is None:
+            return []
+        try:
+            n = self._p.in_waiting
+            if n:
+                self._rx.extend(self._p.read(n))
+        except Exception:
+            return []
+        out = []
+        # NOTE: CircuitPython bytearrays do NOT support slice deletion
+        # (del buf[:n] -> "object doesn't support item deletion"). Consume the
+        # buffer by reassigning it to a slice, which returns a new bytearray.
+        buf = self._rx
+        while True:
+            i = buf.find(SOF)
+            if i < 0:
+                if len(buf) > 1024:
+                    buf = buf[-1:]         # keep a possible lone 0xA5
+                break
+            if len(buf) - i < 6:
+                if i:
+                    buf = buf[i:]
+                break
+            ln = (buf[i + 3] << 8) | buf[i + 4]
+            end = i + 5 + ln + 1           # +1 crc
+            if ln > 4096:                  # garbage length -> skip this SOF
+                buf = buf[i + 2:]
+                continue
+            if len(buf) < end:
+                if i:
+                    buf = buf[i:]
+                break
+            body = bytes(buf[i + 2:i + 5 + ln])
+            if crc8(body) == buf[i + 5 + ln]:
+                out.append((buf[i + 2], bytes(buf[i + 5:i + 5 + ln])))
+            buf = buf[end:]
+        self._rx = buf
+        return out
+
+
+class Lights:
+    """Rear brake/tail + front DRL, animated locally from Jetson state."""
+
+    def __init__(self, pin):
+        total = N_REAR + N_FRONT
+        self._px = None
+        if neopixel is not None and total > 0:
+            try:
+                self._px = neopixel.NeoPixel(
+                    pin, total, auto_write=False, pixel_order=neopixel.GRB)
+            except Exception:
+                self._px = None
+        if REAR_FIRST:
+            self._rear = range(0, N_REAR)
+            self._front = range(N_REAR, N_REAR + N_FRONT)
+        else:
+            self._front = range(0, N_FRONT)
+            self._rear = range(N_FRONT, N_FRONT + N_REAR)
+        # targets from the Jetson
+        self.brake = 0.0
+        self.estop = False
+        self.armed = False
+        self.front_on = True
+        self.warn = False       # corridor warning -> amber flash overlay
+        self._brake_s = 0.0
+
+    def set_state(self, brake, estop, armed, front_on, warn=False):
+        self.brake = brake
+        self.estop = estop
+        self.armed = armed
+        self.front_on = front_on
+        self.warn = warn
+
+    def render(self, now):
+        if self._px is None:
+            return
+        if self.estop:
+            on = (int(now * FLASH_HZ * 2) % 2) == 0
+            r = int(255 * MAX_BRIGHT) if on else 0
+            for i in self._rear:
+                self._px[i] = (r, 0, 0)
+            for i in self._front:
+                self._px[i] = (r, int(r * 0.5), 0)     # amber hazard
+            self._px.show()
+            return
+        if self.warn:
+            # corridor warning: amber flash on the rear strip (distinct from
+            # the solid/graded red of brake+tail and the hard red of estop)
+            on = (int(now * FLASH_HZ * 2) % 2) == 0
+            w = int(255 * MAX_BRIGHT) if on else int(255 * MAX_BRIGHT * 0.1)
+            for i in self._rear:
+                self._px[i] = (w, int(w * 0.45), 0)
+            fl = FRONT_LEVEL if self.front_on else FRONT_LEVEL * 0.4
+            wf = int(255 * MAX_BRIGHT * fl)
+            for i in self._front:
+                self._px[i] = (wf, wf, wf)
+            self._px.show()
+            return
+        a = ATTACK if self.brake > self._brake_s else RELEASE
+        self._brake_s += (self.brake - self._brake_s) * a
+        level = TAIL_LEVEL + (1.0 - TAIL_LEVEL) * self._brake_s
+        r = int(255 * MAX_BRIGHT * level)
+        for i in self._rear:
+            self._px[i] = (r, 0, 0)
+        fl = FRONT_LEVEL if self.front_on else FRONT_LEVEL * 0.4
+        w = int(255 * MAX_BRIGHT * fl)
+        for i in self._front:
+            self._px[i] = (w, w, w)
+        self._px.show()
+
+    def off(self):
+        if self._px is not None:
+            self._px.fill((0, 0, 0))
+            self._px.show()
+
+
+def main():
+    data = usb_cdc.data        # the dedicated DATA endpoint (see boot.py)
+    if data is not None:
+        data.timeout = 0
+    link = Link(data)
+
+    try:
+        uart = busio.UART(NEX_TX_PIN, NEX_RX_PIN, baudrate=NEX_BAUD,
+                          timeout=0, receiver_buffer_size=512)
+    except Exception:
+        uart = None
+        link.log("nextion UART init failed")
+
+    keys = None
+    tokens = []
+    held = []
+    arm_i = disarm_i = -1
+    if keypad is not None and BUTTON_MAP:
+        pins = tuple(BUTTON_MAP.keys())
+        tokens = list(BUTTON_MAP.values())
+        held = [False] * len(tokens)
+        arm_i = tokens.index("arm") if "arm" in tokens else -1
+        disarm_i = tokens.index("disarm") if "disarm" in tokens else -1
+        try:
+            keys = keypad.Keys(pins, value_when_pressed=False, pull=True)
+        except Exception:
+            keys = None
+
+    # Hold ARM + DISARM together for ESTOP_CLEAR_HOLD_S -> one-shot "estop_clear"
+    # token (a deliberate two-button hold so it can't fire by accident).
+    ESTOP_CLEAR_HOLD_S = 3.0
+    combo_since = None
+    combo_fired = False
+
+    # Encoder: software quadrature decode. RP2040 rotaryio uses PIO and needs the
+    # two channels on SEQUENTIAL GPIO; ours (GP12/GP10) are not adjacent, so we
+    # read them as plain inputs and decode the transitions ourselves.
+    _QDEC = (0, -1, 1, 0, 1, 0, 0, -1, -1, 0, 0, 1, 0, 1, -1, 0)
+    ENC_DETENT = 4          # quadrature transitions per detent (tweak if needed)
+    enc_a = enc_b = None
+    enc_state = 0
+    enc_accum = 0
+    if ENCODER_A is not None and ENCODER_B is not None:
+        try:
+            enc_a = digitalio.DigitalInOut(ENCODER_A)
+            enc_a.switch_to_input(pull=digitalio.Pull.UP)
+            enc_b = digitalio.DigitalInOut(ENCODER_B)
+            enc_b.switch_to_input(pull=digitalio.Pull.UP)
+            enc_state = (enc_a.value << 1) | enc_b.value
+            link.log("encoder (sw quad) init OK a=%d b=%d"
+                     % (enc_a.value, enc_b.value))
+        except Exception as _e:
+            enc_a = enc_b = None
+            link.log("encoder init FAILED: %s" % _e)
+
+    # encoder 3 (regen strength) — same software quadrature decode
+    e3_a = e3_b = None
+    e3_state = 0
+    e3_accum = 0
+    if ENCODER3_A is not None and ENCODER3_B is not None:
+        try:
+            e3_a = digitalio.DigitalInOut(ENCODER3_A)
+            e3_a.switch_to_input(pull=digitalio.Pull.UP)
+            e3_b = digitalio.DigitalInOut(ENCODER3_B)
+            e3_b.switch_to_input(pull=digitalio.Pull.UP)
+            e3_state = (e3_a.value << 1) | e3_b.value
+            link.log("encoder3 (sw quad) init OK a=%d b=%d"
+                     % (e3_a.value, e3_b.value))
+        except Exception as _e:
+            e3_a = e3_b = None
+            link.log("encoder3 init FAILED: %s" % _e)
+
+    # encoder 2 (debug drive-speed setpoint) — same software quadrature decode
+    e2_a = e2_b = None
+    e2_state = 0
+    e2_accum = 0
+    if ENCODER2_A is not None and ENCODER2_B is not None:
+        try:
+            e2_a = digitalio.DigitalInOut(ENCODER2_A)
+            e2_a.switch_to_input(pull=digitalio.Pull.UP)
+            e2_b = digitalio.DigitalInOut(ENCODER2_B)
+            e2_b.switch_to_input(pull=digitalio.Pull.UP)
+            e2_state = (e2_a.value << 1) | e2_b.value
+            link.log("encoder2 (sw quad) init OK a=%d b=%d"
+                     % (e2_a.value, e2_b.value))
+        except Exception as _e:
+            e2_a = e2_b = None
+            link.log("encoder2 init FAILED: %s" % _e)
+
+    lights = Lights(NEOPIXEL_PIN)
+    link.log("ethon wheel hub up: leds=%s nextion=%s keys=%s enc=%s"
+             % (lights._px is not None, uart is not None, keys is not None,
+                enc_a is not None))
+
+    last_led = 0.0
+    led_period = 1.0 / LED_FPS
+
+    while True:
+        now = time.monotonic()
+
+        # 1) USB frames in -> route
+        for ch, payload in link.poll():
+            if ch == CH_NEXTION and uart is not None and payload:
+                try:
+                    uart.write(payload)
+                except Exception:
+                    pass
+            elif ch == CH_LED and len(payload) >= 4:
+                brake = payload[0] / 255.0
+                estop = bool(payload[1])
+                armed = bool(payload[2])
+                front_on = bool(payload[3])
+                warn = bool(payload[4]) if len(payload) >= 5 else False
+                lights.set_state(brake, estop, armed, front_on, warn)
+
+        # 2) Nextion bytes out -> frame to USB
+        if uart is not None:
+            try:
+                w = uart.in_waiting
+                if w:
+                    link.send(CH_NEXTION, uart.read(w))
+            except Exception:
+                pass
+
+        # 3) buttons -> tokens (+ ARM+DISARM hold gesture -> estop_clear)
+        if keys is not None:
+            ev = keys.events.get()
+            while ev is not None:
+                if 0 <= ev.key_number < len(held):
+                    held[ev.key_number] = ev.pressed
+                if ev.pressed and 0 <= ev.key_number < len(tokens):
+                    link.send(CH_BUTTON, tokens[ev.key_number].encode("ascii"))
+                ev = keys.events.get()
+            # both held continuously for the hold time -> fire once, then latch
+            # until at least one is released.
+            if arm_i >= 0 and disarm_i >= 0 and held[arm_i] and held[disarm_i]:
+                if combo_since is None:
+                    combo_since = now
+                elif (now - combo_since) >= ESTOP_CLEAR_HOLD_S and not combo_fired:
+                    combo_fired = True
+                    link.send(CH_BUTTON, b"estop_clear")
+                    link.log("ARM+DISARM held %.0fs -> estop_clear"
+                             % ESTOP_CLEAR_HOLD_S)
+            else:
+                combo_since = None
+                combo_fired = False
+
+        # 4) encoder (software quadrature) -> enc+/enc-
+        if enc_a is not None:
+            st = (enc_a.value << 1) | enc_b.value
+            if st != enc_state:
+                enc_accum += _QDEC[(enc_state << 2) | st]
+                enc_state = st
+                while enc_accum >= ENC_DETENT:
+                    link.send(CH_BUTTON, b"enc+")
+                    enc_accum -= ENC_DETENT
+                while enc_accum <= -ENC_DETENT:
+                    link.send(CH_BUTTON, b"enc-")
+                    enc_accum += ENC_DETENT
+
+        # 4b) encoder 3 -> e3+/e3- (regen strength)
+        if e3_a is not None:
+            st = (e3_a.value << 1) | e3_b.value
+            if st != e3_state:
+                e3_accum += _QDEC[(e3_state << 2) | st]
+                e3_state = st
+                while e3_accum >= ENC_DETENT:
+                    link.send(CH_BUTTON, b"e3+")
+                    e3_accum -= ENC_DETENT
+                while e3_accum <= -ENC_DETENT:
+                    link.send(CH_BUTTON, b"e3-")
+                    e3_accum += ENC_DETENT
+
+        # 4c) encoder 2 -> e2+/e2- (debug drive-speed setpoint)
+        if e2_a is not None:
+            st = (e2_a.value << 1) | e2_b.value
+            if st != e2_state:
+                e2_accum += _QDEC[(e2_state << 2) | st]
+                e2_state = st
+                while e2_accum >= ENC_DETENT:
+                    link.send(CH_BUTTON, b"e2+")
+                    e2_accum -= ENC_DETENT
+                while e2_accum <= -ENC_DETENT:
+                    link.send(CH_BUTTON, b"e2-")
+                    e2_accum += ENC_DETENT
+
+        # 5) animate LEDs (throttled)
+        if now - last_led >= led_period:
+            last_led = now
+            lights.render(now)
+
+
+try:
+    main()
+except Exception as exc:        # last-ditch: keep the console alive for debug
+    try:
+        print("FATAL:", exc)
+    except Exception:
+        pass

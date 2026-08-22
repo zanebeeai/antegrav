@@ -1,0 +1,9 @@
+# Keep deployable Jetson text files Linux-compatible on every platform.
+FIRMWARE.md text eol=lf
+jetson/ethon/** text=auto eol=lf
+
+# Preserve calibration and firmware artifacts byte-for-byte.
+jetson/ethon/**/*.jpg binary
+jetson/ethon/**/*.npy binary
+jetson/ethon/**/*.npz binary
+jetson/ethon/**/*.uf2 binary

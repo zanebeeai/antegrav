@@ -1,0 +1,19 @@
+[Unit]
+Description=Ethon active-learning data capture (CSI cams + TRT)
+After=multi-user.target
+
+[Service]
+Type=simple
+User=jetson
+WorkingDirectory=/home/jetson/ethon
+ExecStart=/usr/bin/python3 /home/jetson/ethon/ethon_capture.py
+Restart=on-failure
+RestartSec=10
+# don't fight the HDMI display app for the cameras. The bracketed first
+# char stops pgrep from matching its own guard process (whose command line
+# contains this very string) -- without it the check always "finds" itself
+# and the service can never start.
+ExecStartPre=/bin/bash -c '! pgrep -f "[e]thon_display.py"'
+
+[Install]
+WantedBy=multi-user.target

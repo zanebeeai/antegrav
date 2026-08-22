@@ -1,0 +1,1445 @@
+#!/usr/bin/env python3
+"""
+Ethon drive controller — Kraken X60s on Jetson via CANivore + Phoenix 6 (no RoboRIO).
+
+Drivetrain (port of the proven Robot.java logic):
+  - 3x Kraken X60 drive (CAN 0 master, 1 & 2 followers, aligned) -> 11.46:1
+    reduction -> single 26" rear wheel
+  - single-pedal torque map: positive cmd accelerates, lifting off regen-brakes
+    (FOC mode only — in duty mode, where duty is speed-like rather than
+    torque-like, the map is replaced by a feedforward+P velocity law with a
+    device-side duty ramp; see the duty_* config keys and _tick)
+  - reverse torque capped at REVERSE_CAP of the (derated) limit
+  - thermal derate: 80 A -> 50 A linearly over 55 -> 70 C (hottest motor)
+
+Steering:
+  - Kraken X60 (CAN 4), spur gears (5:1 = 18T:90T, module 1.25, 67.5 mm C-C)
+    to the steering column, with soft
+    limits and a 15 A torque cap so the driver can ALWAYS overpower the motor.
+  - TWO control paths, selected by the same `use_foc` toggle as the drive:
+      use_foc true  -> PositionTorqueCurrentFOC, gain slot 0 (needs Pro licence)
+      use_foc false -> PositionDutyCycle,        gain slot 1 (no licence),
+                       output bounded by `steer_peak_duty`.
+    Separate slots mean flipping the toggle needs no retuning.
+  - Homed at boot by `steer_home_method`: "cancoder" (absolute, needs the
+    CANcoder within +/-0.5 column rot of centre) or "lock_to_lock" (sweep both
+    mechanical stops current-limited, centre on the midpoint, derive the soft
+    limits from the measured range). If homing fails the node runs DRIVE-ONLY
+    unless `allow_unhomed_steering: true` (bench only, wheels centred).
+
+Config:
+  /home/jetson/ethon/vehicle.yaml (yaml.safe_load) overrides every entry in
+  CONFIG_DEFAULTS below. Missing file -> built-in defaults with a warning.
+  A commented template lives next to this file in the repo (vehicle.yaml).
+
+Topics:
+  sub  /cmd_vel             geometry_msgs/Twist  linear.x m/s, angular.z rad/s
+  sub  /ethon/estop         std_msgs/Bool        true latches motors off until restart
+  pub  /ethon/drive_status  std_msgs/String      JSON health snapshot at 2 Hz
+
+Safety model (vehicle carries a human — software fails SILENT, never ACTIVE):
+  - Phoenix 6 non-FRC devices neutral themselves unless
+    unmanaged.feed_enable() is called continuously. We feed ONLY while a
+    fresh /cmd_vel exists and the e-stop latch is clear. Process/ROS death
+    -> Krakens disable within FEED_ENABLE_S (0.1 s) on their own; a stalled
+    planner -> within cmd_timeout_s + FEED_ENABLE_S (~0.35 s).
+  - geometry_measured false in vehicle.yaml (or missing/unreadable yaml)
+    -> CONFIG HOLD: motors are never commanded with placeholder geometry.
+  - /ethon/estop true sends NeutralOut and latches disabled until restart.
+  - SIGINT / SIGTERM -> NeutralOut to every motor before exit.
+  - The physical e-stop relay on motor power remains REQUIRED. This code is
+    never the last line of defense.
+
+Run via systemd: ethon-drive.service (after ethon-can.service).
+"""
+
+import json
+import math
+import os
+import signal
+import threading
+import time
+from types import SimpleNamespace
+
+import yaml
+import serial   # python3-serial -- pedal link, same dependency as wheel_bridge.py
+
+import rclpy
+from rclpy.executors import ExternalShutdownException
+from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+from geometry_msgs.msg import Twist
+from std_msgs.msg import Bool, String, Float64
+
+from phoenix6 import unmanaged
+from phoenix6.hardware import CANcoder, TalonFX
+from phoenix6.controls import (
+    DutyCycleOut,
+    Follower,
+    NeutralOut,
+    PositionDutyCycle,
+    PositionTorqueCurrentFOC,
+    TorqueCurrentFOC,
+)
+from phoenix6.configs import TalonFXConfiguration
+from phoenix6.signals import InvertedValue, MotorAlignmentValue
+
+# ── CAN bus ───────────────────────────────────────────────────────────────
+# Preferred bus is the CANivore name; if it does not respond we fall back
+# through this list (can0 = Jetson native CAN header / SocketCAN). The probe
+# is best-effort: if your CANivore is named differently, set `can_bus` in
+# vehicle.yaml — that name is always tried first.
+# This car has NO CANivore — the 4 Krakens hang off the Jetson's native CAN
+# controller (mttcan) through an SN65HVD230, i.e. SocketCAN 'can0'. Probing a
+# 'canivore' bus is not merely useless: constructing a device on a phoenix6
+# bus name registers it with the native runtime, which then retries the
+# connection FOREVER and logs "CANbus Failed to Connect: canivore" every ~3 s
+# for the life of the process. Keep the fallback list to buses that can exist.
+CAN_BUS = "can0"
+CAN_BUS_FALLBACKS = ["can0"]
+CAN_PROBE_TIMEOUT_S = 0.5
+
+# ── files / topics ────────────────────────────────────────────────────────
+CONFIG_PATH = "/home/jetson/ethon/vehicle.yaml"
+TOPIC_CMD_VEL = "/cmd_vel"
+TOPIC_ESTOP = "/ethon/estop"
+TOPIC_ARMED = "/ethon/hmi/armed"   # latched Bool from the planner; single
+                                   # source of truth for "autonomy is driving"
+TOPIC_STATUS = "/ethon/drive_status"
+
+# ── loop rates / timing ───────────────────────────────────────────────────
+TICK_HZ = 50.0                 # control loop
+STATUS_HZ = 2.0                # /ethon/drive_status publish rate
+FEED_ENABLE_S = 0.1            # enable window fed per fresh tick
+SIGNAL_PROBE_TIMEOUT_S = 0.5   # CANcoder / version-signal probe timeout
+CONFIG_APPLY_RETRIES = 3       # configurator.apply attempts per device
+ACKERMANN_MIN_SPEED_MS = 0.3   # below this commanded speed, steer to centre
+EFFIC_MIN_DIST_M = 5.0         # min distance before reporting Wh/km (avoid /~0)
+# Steering lock-to-lock homing (opt-in via steer_home_method="lock_to_lock").
+# Every value below is now a TUNEABLE vehicle.yaml / ROS param (see DEFAULTS:
+# steer_home_current_a, steer_home_duty, steer_home_stall_rps,
+# steer_home_stall_s, steer_home_timeout_s, steer_home_margin_rot,
+# steer_home_right_sign). Only the loop rate stays a constant.
+# UNTESTED ON HARDWARE — tune against the real steering before trusting it; a
+# stall threshold that is too high reads a false stop mid-travel, too low never
+# triggers.
+STEER_HOME_RATE_HZ = 100.0     # sweep control-loop rate
+STEER_HOME_SETTLE_S = 0.6      # pause between the two sweeps and before centring
+STEER_HOME_CENTRE_TIMEOUT_S = 20.0  # abort the drive-to-centre if it never
+                                    # arrives (scales with steer_home_duty —
+                                    # centring creeps at the same duty)
+STEER_HOME_CENTRE_TOL_ROT = 0.05    # rotor rotations from centre = "centred"
+TOPIC_DRIVE_TEST = "/ethon/drive_test"   # bench-test direct duty override (Float64)
+TOPIC_STEER_TEST = "/ethon/steer_test_deg"  # bench-test direct road-angle override (Float64, deg)
+
+# ── manual-drive pedal ───────────────────────────────────────────────────
+# XIAO RP2040 (see pico/pedal_code.py) streams normalised pedal position
+# (0.0-1.0 ASCII float, one line per sample) over its own dedicated USB CDC
+# port -- NOT /cmd_vel, so it can never fight cone_corridor_planner's
+# publishes there (see ethon_drive.py module docstring / wheel_bridge.py's
+# own debug-encoder warning about exactly that failure mode). Optional
+# hardware: if the port is not present, the pedal is simply inert and
+# nothing else about the node's behaviour changes.
+PEDAL_PORT = "/dev/ethon-pedal"   # udev symlink -- TODO once hardware is
+                                   # plugged in and its USB serial is known
+                                   # (see 99-ethon-usb.rules)
+PEDAL_BAUD = 115200
+PEDAL_TIMEOUT_S = 0.3              # stale pedal link -> treated as unplugged
+
+# ── wheel brake button ──────────────────────────────────────────────────
+# Any of the 3 encoder push-buttons on the wheel (see pico/code.py's
+# BUTTON_MAP) sends a momentary "brake" token, relayed by wheel_bridge.py as
+# a Bool on this topic. Top priority in _tick() -- above even the manual
+# pedal -- forces full regen-decelerate for BRAKE_TIMEOUT_S, re-triggerable
+# by pressing again. A TAP-for-a-pulse design, not proportional hold-to-
+# brake: the wheel firmware only reports button PRESS events today, not
+# release, so there is no clean way to know when the driver lets go.
+TOPIC_BRAKE = "/ethon/brake_request"
+BRAKE_TIMEOUT_S = 1.5
+
+# ── wheel reverse button (hold to reverse throttle) ─────────────────────
+# wheel_bridge.py re-publishes True at 10 Hz while the button is held (see
+# its _push_reverse). REVERSE_TIMEOUT_S is deliberately a bit looser than
+# that 0.1s period -- comfortable margin against one missed tick -- but
+# still tight enough that a dropped link releases it quickly, not stuck.
+TOPIC_REVERSE = "/ethon/reverse_request"
+REVERSE_TIMEOUT_S = 0.5
+TEST_TIMEOUT_S = 0.5           # bench-test command watchdog (dashboard re-posts
+                               # continuously; motors stop within this if it stops)
+
+# ── configurable vehicle constants (overridden by vehicle.yaml) ───────────
+# Keys marked MEASURE are placeholders — measure on the car before driving.
+CONFIG_DEFAULTS = {
+    # CAN
+    "can_bus": CAN_BUS,
+    "drive_master_id": 0,
+    "drive_follower_ids": [1, 2],
+    "steer_can_id": 3,
+    "cancoder_can_id": 4,
+    # drivetrain
+    "wheel_dia_m": 26 * 0.0254,     # 26" rear wheel
+    "gear_ratio": 11.46,            # motor rotations per wheel rotation
+    "max_speed_ms": 8.0,            # /cmd_vel saturation speed
+    "drive_inverted": False,        # BENCH-VERIFY: +cmd must roll forward
+    "steer_inverted": False,        # BENCH-VERIFY: +angular.z must steer LEFT
+    "max_drive_a": 80.0,            # full torque current (cool motors)
+    "min_drive_a": 50.0,            # derated current at temp ceiling
+    "derate_lo_c": 55.0,
+    "derate_hi_c": 70.0,
+    "reverse_cap": 0.30,            # reverse torque fraction
+    "reverse_speed_frac": 0.30,     # hold-to-reverse SPEED cap: full pedal in
+                                    # reverse commands this fraction of
+                                    # max_speed_ms (0.30 -> 2.4 m/s)
+    "regen_a": 40.0,                # max regen braking current
+    "regen_deadband_ms": 0.5,       # m/s below wheel speed before regen
+    "regen_ramp_ms": 2.0,           # m/s of speed error for full regen
+    # control mode: True = TorqueCurrentFOC (needs a Phoenix Pro license per
+    # device); False = DutyCycleOut, open-loop, no license required. Live-
+    # toggleable from the dashboard. Default False so the drive works on
+    # unlicensed devices; flip to True once Pro licensing is sorted.
+    "use_foc": False,
+    "test_max_duty": 0.30,          # bench-test duty-cycle safety cap (fraction)
+    # Duty-mode (use_foc false) velocity law. Duty cycle is a SPEED-like
+    # actuator (steady-state wheel speed ~ duty x free speed), not a torque:
+    # running the torque map's amps through it turns the map's 0.5 m/s fade
+    # band into a proportional speed loop with a gain of ~36 — far past
+    # oscillation. Duty mode instead uses feedforward + a gentle P trim:
+    #   duty = v_cmd/duty_kv_ms + duty_kp * (v_cmd - wheel_ms)
+    # with braking on its own steeper gain and its own LOW cap, because
+    # negative duty on a rolling motor is plugging (drives against back-EMF),
+    # much harsher than the same current in regen.
+    "duty_kv_ms": 18.0,             # TUNE — wheel m/s at duty 1.0 (~free speed:
+                                    # 100 rps rotor / 11.46 x pi x 0.66 m ≈ 18)
+    "duty_kp": 0.02,                # TUNE — duty per m/s of speed error (drive)
+    "duty_brake_kp": 0.08,          # TUNE — duty per m/s of overspeed (braking)
+    "duty_brake_max": 0.15,         # braking/plugging duty cap (before
+                                    # regen_strength scaling)
+    "duty_ramp_s": 0.15,            # device-side 0->full duty ramp, seconds —
+                                    # smooths every 50 Hz step at 1 kHz on the
+                                    # Talon itself (also covers the bench test)
+    # steering
+    "wheelbase_m": 1.60,            # MEASURE
+    "steer_col_ratio": 12.0,        # MEASURE — steering-wheel deg per road-wheel deg
+    "steer_belt_ratio": 4.0,        # MEASURE — motor rots per column rot
+    "steer_limit_rot": 1.0,         # MEASURE — soft limit, +/- column rots
+    "steer_max_a": 15.0,            # driver must be able to overpower
+    # Steering closed-loop gains. Two independent slots so the use_foc toggle
+    # switches control mode WITHOUT retuning: slot 0 drives
+    # PositionTorqueCurrentFOC (gain units: amps per rotor-rotation of error,
+    # needs a Pro licence); slot 1 drives PositionDutyCycle (units: duty
+    # fraction per rotor-rotation of error, no licence). Error is in ROTOR
+    # rotations, so 1 column rotation = steer_belt_ratio rotor rotations.
+    # ALL FOUR ARE UNTUNED STARTING POINTS — bench-tune with wheels off the
+    # ground, raising kp until it tracks without hunting, then add kd.
+    "steer_kp_foc": 8.0,            # TUNE — A per rotor rot of error
+    "steer_kd_foc": 0.1,            # TUNE
+    "steer_kp_duty": 0.30,          # TUNE — duty per rotor rot of error
+    "steer_kd_duty": 0.02,          # TUNE — duty per rotor rps; 0.004 was ~zero
+                                    # damping and the position loop hunted
+                                    # through the gear backlash
+    "steer_slew_col_rps": 1.5,      # column target slew limit, rot/s — the raw
+                                    # 50 Hz Ackermann target dithers with omega
+                                    # noise; the wheel should not chase that.
+                                    # 1.5 still covers the full ±0.40 rot range
+                                    # in ~0.27 s. Bench steer_test bypasses it.
+    "steer_peak_duty": 0.25,        # duty cap for the non-FOC steering path —
+                                    # the hand-overpower guarantee in duty mode
+                                    # (stator limit still applies on top)
+    # homing method: "cancoder" (seed rotor from the absolute CANcoder) or
+    # "lock_to_lock" (sweep to both mechanical stops, centre on the midpoint,
+    # derive soft limits from the measured range).
+    "steer_home_method": "cancoder",
+    # ── lock-to-lock homing tuning (only used when method == "lock_to_lock") ──
+    # The sweep runs open-loop DutyCycleOut (no Pro licence) but the TORQUE it
+    # can apply against a stop is set by the stator current limit, which is
+    # temporarily dropped to steer_home_current_a for the sweep and restored to
+    # steer_max_a afterwards. Keep this LOW: it must be enough to reach the
+    # stop but gentle enough that stalling against it cannot damage the belt,
+    # pulleys or column, and so a hand on the wheel always wins.
+    "steer_home_current_a": 8.0,    # TUNE — stator current cap during homing
+    # Sweep speed. duty, stall_rps and timeout MUST be tuned together: the
+    # stall threshold has to sit well BELOW the free-running rotor velocity at
+    # this duty, or the sweep reads "stalled" the instant it starts moving and
+    # records a false stop. Halving the duty roughly halves that velocity.
+    "steer_home_duty": 0.05,        # open-loop duty swept toward each stop
+    "steer_home_stall_rps": 0.15,   # |rotor velocity| below this = stalled
+    "steer_home_stall_s": 0.50,     # ...sustained this long = stop reached
+    "steer_home_timeout_s": 15.0,   # abort a sweep if no stop found in this time
+    "steer_home_margin_rot": 0.05,  # column rots kept inside each stop
+    "steer_home_right_sign": 1.0,   # duty sign that drives RIGHT (flip to -1.0
+                                    # if the first sweep goes the wrong way)
+    # Plausibility floor, in COLUMN rotations of half-range. A sweep that
+    # stalls early (tight spot, someone's hand, too high a stall threshold)
+    # yields a tiny range; accepting it silently ENABLES steering that is
+    # effectively locked straight. Reject anything below this instead.
+    "steer_home_min_half_rot": 0.15,
+    "cancoder_offset_rot": 0.0,     # MEASURE — CANcoder reading at centre
+    "cancoder_invert": False,
+    "allow_unhomed_steering": False,
+    # safety
+    "geometry_measured": False,     # set true ONLY after filling every MEASURE
+                                    # key from the real car. While false the
+                                    # node refuses to command motors at all.
+    # timing
+    "cmd_timeout_s": 0.25,          # stale /cmd_vel -> disable
+}
+
+# Per-fault getters probed defensively (phoenix6 API drifts across versions;
+# missing getters are simply skipped).
+FAULT_GETTERS = (
+    "get_fault_hardware",
+    "get_fault_device_temp",
+    "get_fault_proc_temp",
+    "get_fault_undervoltage",
+    "get_fault_over_supply_v",
+    "get_fault_unstable_supply_v",
+    "get_fault_bridge_brownout",
+    "get_fault_boot_during_enable",
+    "get_fault_unlicensed_feature_in_use",
+    "get_fault_forward_soft_limit",
+    "get_fault_reverse_soft_limit",
+    "get_fault_stator_curr_limit",
+    "get_fault_supply_curr_limit",
+)
+
+BANNER = "*" * 68
+
+
+# ── helpers ───────────────────────────────────────────────────────────────
+
+def _clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
+
+
+def _round(x, ndigits: int = 2):
+    """Round for JSON, passing None through."""
+    return None if x is None else round(float(x), ndigits)
+
+
+def _coerce(default, value):
+    """Coerce a YAML value to the type of its built-in default."""
+    if isinstance(default, bool):                 # bool first: bool < int
+        if not isinstance(value, bool):
+            raise TypeError("expected bool")
+        return value
+    if isinstance(default, int):
+        return int(value)
+    if isinstance(default, float):
+        return float(value)
+    if isinstance(default, str):
+        return str(value)
+    if isinstance(default, list):
+        return [int(x) for x in value]
+    raise TypeError(f"unsupported config type {type(default).__name__}")
+
+
+def load_vehicle_config(path: str, logger) -> SimpleNamespace:
+    """Load vehicle.yaml over CONFIG_DEFAULTS. Any failure -> defaults."""
+    cfg = {k: (list(v) if isinstance(v, list) else v)
+           for k, v in CONFIG_DEFAULTS.items()}
+    try:
+        with open(path, "r") as f:
+            data = yaml.safe_load(f) or {}
+    except FileNotFoundError:
+        logger.warning(
+            f"{path} not found — using built-in defaults "
+            "(geometry placeholders are UNMEASURED)")
+        return SimpleNamespace(**cfg)
+    except Exception as exc:
+        logger.error(f"failed to read {path}: {exc} — using built-in defaults")
+        return SimpleNamespace(**cfg)
+
+    if not isinstance(data, dict):
+        logger.error(f"{path}: top level must be a mapping — using defaults")
+        return SimpleNamespace(**cfg)
+
+    for key, value in data.items():
+        if key not in cfg:
+            logger.warning(f"{path}: unknown key '{key}' ignored")
+            continue
+        try:
+            cfg[key] = _coerce(cfg[key], value)
+        except Exception:
+            logger.error(
+                f"{path}: bad value for '{key}' ({value!r}) — "
+                f"keeping default {cfg[key]!r}")
+    logger.info(f"vehicle config loaded from {path}")
+    return SimpleNamespace(**cfg)
+
+
+def _bus_responds(name: str, probe_device_id: int) -> bool:
+    """Best-effort liveness probe of a CAN bus name.
+
+    A SocketCAN name that has no matching netdev is rejected WITHOUT touching
+    phoenix6: constructing a device on a bus registers it with the native
+    runtime, which then retries that connection for the life of the process
+    and spams the log. Never probe a bus that cannot exist.
+    """
+    if name.startswith(("can", "vcan")) and not os.path.isdir(
+            "/sys/class/net/%s" % name):
+        return False
+    # 1) CANBus API where available (newer phoenix6 builds).
+    try:
+        from phoenix6 import CANBus
+        up = getattr(CANBus(name), "is_network_up")
+        if callable(up):
+            up = up()
+        if isinstance(up, bool):
+            return up
+    except Exception:
+        pass
+    # 2) Fall back: read the version signal of the drive master on this bus.
+    try:
+        sig = TalonFX(probe_device_id, name).get_version()
+        sig.wait_for_update(CAN_PROBE_TIMEOUT_S)
+        return sig.status.is_ok()
+    except Exception:
+        return False
+
+
+def resolve_can_bus(preferred: str, probe_device_id: int, logger) -> str:
+    """Return the first responding bus; fall back to `preferred` if none do."""
+    candidates = [preferred] + [b for b in CAN_BUS_FALLBACKS if b != preferred]
+    for name in candidates:
+        if _bus_responds(name, probe_device_id):
+            if name != preferred:
+                logger.warning(
+                    f"CAN bus '{preferred}' not responding — "
+                    f"falling back to '{name}'")
+            else:
+                logger.info(f"CAN bus '{name}' is up")
+            return name
+    logger.error(
+        f"no CAN bus responded (tried {candidates}) — proceeding with "
+        f"'{preferred}'; devices will be unreachable until the bus appears. "
+        "Check `ip -details link show can0` (should be UP, classic 1 Mbps, "
+        "ERROR-ACTIVE), motor power, and `can_bus` in vehicle.yaml. If the "
+        "link is UP but silent, the mttcan control-mode flags are sticky — "
+        "re-up it explicitly with `fd off listen-only off`.")
+    return preferred
+
+
+def apply_device_config(device, dev_cfg, label: str, logger) -> bool:
+    """Apply a device configuration with retries. Returns success."""
+    for attempt in range(1, CONFIG_APPLY_RETRIES + 1):
+        try:
+            status = device.configurator.apply(dev_cfg)
+            if status.is_ok():
+                return True
+            logger.warning(
+                f"config apply to {label}, attempt {attempt}: {status.name}")
+        except Exception as exc:
+            logger.warning(f"config apply to {label}, attempt {attempt}: {exc}")
+        time.sleep(0.1)
+    logger.error(
+        f"FAILED to apply config to {label} after {CONFIG_APPLY_RETRIES} attempts")
+    return False
+
+
+def read_faults(device) -> list:
+    """Active fault names for a device, defensively across phoenix6 versions."""
+    names, readable = [], False
+    for getter in FAULT_GETTERS:
+        fn = getattr(device, getter, None)
+        if fn is None:
+            continue
+        try:
+            sig = fn()
+            if not sig.status.is_ok():
+                continue
+            readable = True
+            if bool(sig.value):
+                names.append(getter[len("get_fault_"):])
+        except Exception:
+            continue
+    if not readable:
+        # Per-fault getters unusable — try the raw bitfield instead.
+        try:
+            sig = device.get_fault_field()
+            if sig.status.is_ok():
+                raw = int(sig.value)
+                return [f"raw:0x{raw:X}"] if raw else []
+        except Exception:
+            pass
+        return ["unavailable"]
+    return names
+
+
+def signal_value(device, getter_name: str):
+    """Read a status-signal value defensively; None on any failure."""
+    try:
+        sig = getattr(device, getter_name)()
+        if hasattr(sig, "status") and not sig.status.is_ok():
+            return None
+        return float(sig.value)
+    except Exception:
+        return None
+
+
+# ── node ──────────────────────────────────────────────────────────────────
+
+class EthonDrive(Node):
+    """50 Hz torque-based drive + steering controller for the Ethon EV."""
+
+    def __init__(self):
+        super().__init__("ethon_drive")
+        log = self.get_logger()
+
+        self.cfg = load_vehicle_config(CONFIG_PATH, log)
+        cfg = self.cfg
+
+        # Must exist before ANY set_control call. Steering homing (below) runs
+        # during __init__ and neutrals the motor on every exit path, so this
+        # cannot be deferred to the state block further down.
+        self._neutral = NeutralOut()
+
+        self.can_bus = resolve_can_bus(cfg.can_bus, cfg.drive_master_id, log)
+
+        # ── drive motors ──
+        self.drive = TalonFX(cfg.drive_master_id, self.can_bus)
+        self.followers = [TalonFX(i, self.can_bus) for i in cfg.drive_follower_ids]
+        dcfg = TalonFXConfiguration()
+        # Invert is set EXPLICITLY from vehicle.yaml: configurator.apply()
+        # with a full config object resets any Tuner-flashed invert to factory
+        # default, so the yaml knob is the single source of truth. Followers
+        # use Follower (not StrictFollower) and so track the master's invert.
+        dcfg.motor_output.inverted = (
+            InvertedValue.CLOCKWISE_POSITIVE if cfg.drive_inverted
+            else InvertedValue.COUNTER_CLOCKWISE_POSITIVE)
+        dcfg.torque_current.peak_forward_torque_current = cfg.max_drive_a
+        dcfg.torque_current.peak_reverse_torque_current = -cfg.max_drive_a
+        # Stator current limit protects the motor in DutyCycleOut / VoltageOut
+        # (non-FOC) modes, where the torque-current peaks above do not apply.
+        # This is a base feature (no Pro license needed) and is what makes the
+        # open-loop duty path and the bench test safe against a stall.
+        dcfg.current_limits.stator_current_limit = cfg.max_drive_a
+        dcfg.current_limits.stator_current_limit_enable = True
+        # Runs on the Talon at 1 kHz, so a ragged 50 Hz command stream (or a
+        # step from the bench test) can never slam the output. Watchdog
+        # disable and NeutralOut are NOT ramped — safety cuts stay instant.
+        dcfg.open_loop_ramps.duty_cycle_open_loop_ramp_period = float(
+            cfg.duty_ramp_s)
+        apply_device_config(self.drive, dcfg, "drive master", log)
+        for f in self.followers:
+            apply_device_config(f, dcfg, f"drive follower {f.device_id}", log)
+            f.set_control(Follower(cfg.drive_master_id,
+                                   motor_alignment=MotorAlignmentValue.ALIGNED))
+        self._drive_req = TorqueCurrentFOC(0)     # FOC path (needs Pro license)
+        self._drive_req_duty = DutyCycleOut(0)    # non-FOC path + bench test
+
+        # ── steering motor ──
+        self.steer = TalonFX(cfg.steer_can_id, self.can_bus)
+        # Two steering control paths, selected by the SAME use_foc toggle the
+        # drive uses, so one switch changes the whole vehicle consistently:
+        #   use_foc True  -> PositionTorqueCurrentFOC, slot 0 (Pro licence)
+        #   use_foc False -> PositionDutyCycle,        slot 1 (no licence)
+        self._steer_req = PositionTorqueCurrentFOC(0, slot=0)
+        self._steer_req_duty = PositionDutyCycle(0, slot=1)
+        self._steer_lock_half_rotor = None   # measured half-range (lock-to-lock)
+        # Config the steer motor BEFORE homing so a lock-to-lock sweep drives
+        # against the stops current-limited (stator limit) and the FOC torque
+        # cap keeps position control hand-overpowerable. Soft limits start from
+        # the config; lock-to-lock overrides them from the measured range below.
+        scfg = TalonFXConfiguration()
+        scfg.motor_output.inverted = (
+            InvertedValue.CLOCKWISE_POSITIVE if cfg.steer_inverted
+            else InvertedValue.COUNTER_CLOCKWISE_POSITIVE)
+        lim_rotor = cfg.steer_limit_rot * cfg.steer_belt_ratio
+        scfg.software_limit_switch.forward_soft_limit_enable = True
+        scfg.software_limit_switch.forward_soft_limit_threshold = lim_rotor
+        scfg.software_limit_switch.reverse_soft_limit_enable = True
+        scfg.software_limit_switch.reverse_soft_limit_threshold = -lim_rotor
+        scfg.torque_current.peak_forward_torque_current = cfg.steer_max_a
+        scfg.torque_current.peak_reverse_torque_current = -cfg.steer_max_a
+        scfg.current_limits.stator_current_limit = cfg.steer_max_a
+        scfg.current_limits.stator_current_limit_enable = True
+        # Closed-loop gains. Without these the position requests produce ZERO
+        # output no matter the control mode — slot 0 was previously unset, so
+        # the FOC path could never have steered even with a licence.
+        scfg.slot0.k_p = float(cfg.steer_kp_foc)     # FOC: amps per rotor rot
+        scfg.slot0.k_d = float(cfg.steer_kd_foc)
+        scfg.slot1.k_p = float(cfg.steer_kp_duty)    # duty: fraction per rot
+        scfg.slot1.k_d = float(cfg.steer_kd_duty)
+        # Duty cap for the non-FOC path: this is what keeps the steering
+        # hand-overpowerable when torque_current limits do not apply.
+        peak_duty = _clamp(abs(float(cfg.steer_peak_duty)), 0.0, 1.0)
+        scfg.motor_output.peak_forward_duty_cycle = peak_duty
+        scfg.motor_output.peak_reverse_duty_cycle = -peak_duty
+        steer_cfg_ok = apply_device_config(self.steer, scfg, "steer", log)
+
+        # Home (config applied first, above). lock_to_lock also re-derives the
+        # soft limits from the measured stop-to-stop range.
+        if steer_cfg_ok and cfg.steer_home_method == "lock_to_lock":
+            # Homing must never take the node down: a raised exception here
+            # would exit __init__, systemd would restart, and the steering
+            # would sweep again on every restart — a crash loop that keeps
+            # driving the column into its stops. Fail closed instead.
+            try:
+                self.steer_homed = self._home_lock_to_lock()
+            except Exception as exc:
+                log.error("lock-to-lock homing raised %s: %s — steering "
+                          "DISABLED (node continues drive-only)"
+                          % (type(exc).__name__, exc))
+                self.steer_homed = False
+                try:
+                    self.steer.set_control(self._neutral)
+                except Exception:
+                    pass
+            # The sweep runs with soft limits DISABLED and a reduced current
+            # cap, so the full operating config must be re-applied afterwards
+            # whether homing succeeded or not — otherwise a failed home would
+            # leave the device with no soft limits at all.
+            if self.steer_homed and self._steer_lock_half_rotor is not None:
+                scfg.software_limit_switch.forward_soft_limit_threshold = \
+                    self._steer_lock_half_rotor
+                scfg.software_limit_switch.reverse_soft_limit_threshold = \
+                    -self._steer_lock_half_rotor
+            if not apply_device_config(self.steer, scfg,
+                                       "steer soft-limits", log):
+                log.error("could not restore steer soft limits/current cap "
+                          "after homing — steering DISABLED")
+                self.steer_homed = False
+                steer_cfg_ok = False
+        else:
+            self.steer_homed = self._home_steering()
+
+        # Steering is only commanded when homed (or explicitly allowed
+        # unhomed) AND the torque-cap/soft-limit config actually applied —
+        # without the 15 A cap the driver may not be able to overpower it.
+        self.steer_enabled = (self.steer_homed or cfg.allow_unhomed_steering) \
+            and steer_cfg_ok
+        self._log_steering_mode(steer_cfg_ok)
+
+        # ── state ──
+        self._lock = threading.Lock()
+        self._cmd = (0.0, 0.0)          # (linear.x m/s, angular.z rad/s)
+        self._cmd_time = 0.0            # monotonic of last cmd; 0 = never
+        self._estop_latched = False
+        self._estop_clear_logged = False
+        self._shutdown_done = False
+        # Slewed steering column target (column rot). None = steering is
+        # currently released; on re-engage it re-seeds from the MEASURED
+        # column position so the wheel never snaps from wherever the driver
+        # left it to a stale target.
+        self._steer_col_out = None
+
+        # Refuse to drive on placeholder geometry: a missing/garbled
+        # vehicle.yaml must not silently arm motors with guessed ratios.
+        self.config_hold = not cfg.geometry_measured
+        if self.config_hold:
+            log.error(BANNER)
+            log.error("*  CONFIG HOLD — geometry_measured is false (or")
+            log.error("*  vehicle.yaml missing/unreadable). Motors will NOT")
+            log.error("*  be commanded. Measure the car, fill vehicle.yaml,")
+            log.error("*  set geometry_measured: true, restart this node.")
+            log.error(BANNER)
+
+        # ── ROS interfaces ──
+        self.create_subscription(Twist, TOPIC_CMD_VEL, self._on_cmd, 10)
+        # E-stop arrives both ways: health_monitor latches it TRANSIENT_LOCAL
+        # (so a restarting drive node still sees it — a volatile-only sub
+        # would re-arm overheated motors after a systemd restart), while a
+        # manual `ros2 topic pub` is plain volatile. Subscribe to both.
+        self.create_subscription(Bool, TOPIC_ESTOP, self._on_estop, 10)
+        self.create_subscription(
+            Bool, TOPIC_ESTOP, self._on_estop,
+            QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
+                       durability=DurabilityPolicy.TRANSIENT_LOCAL))
+        # Armed state. The planner publishes this LATCHED (TRANSIENT_LOCAL) on
+        # every arm change and at boot; it is the single source of truth for
+        # "autonomy is driving". It is NOT the same as /cmd_vel freshness — the
+        # planner keeps publishing zero cmd_vel while DISARMED, so without this
+        # the steering would hold centre against the driver's hands whenever
+        # the node is up. Default False: assume the human is driving.
+        self._armed = False
+        self.create_subscription(
+            Bool, TOPIC_ARMED, self._on_armed,
+            QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
+                       durability=DurabilityPolicy.TRANSIENT_LOCAL))
+        self._status_pub = self.create_publisher(String, TOPIC_STATUS, 10)
+        # Driver-adjustable regen (e-brake) strength, nudged live from wheel
+        # encoder 3 via set_parameters. Scales the regen current only (drive
+        # torque untouched). Floored at 0.2 in use: regen is the ONLY service
+        # brake right now, so the dial must never reach zero braking.
+        self.declare_parameter("regen_strength", 1.0)
+        # Control mode (live-toggleable from the dashboard) + bench-test cap.
+        self.declare_parameter("use_foc", bool(cfg.use_foc))
+        self.declare_parameter("test_max_duty", float(cfg.test_max_duty))
+        # Duty-mode velocity-law gains + steering slew, live-tuneable from the
+        # dashboard param editor so smoothness can be dialled in on the bench
+        # without a restart per attempt. vehicle.yaml sets the boot defaults;
+        # persist a value you like by writing it back there.
+        self.declare_parameter("duty_kv_ms", float(cfg.duty_kv_ms))
+        self.declare_parameter("duty_kp", float(cfg.duty_kp))
+        self.declare_parameter("duty_brake_kp", float(cfg.duty_brake_kp))
+        self.declare_parameter("duty_brake_max", float(cfg.duty_brake_max))
+        self.declare_parameter(
+            "steer_slew_col_rps", float(cfg.steer_slew_col_rps))
+        # Bench test: a direct open-loop duty-cycle override on /ethon/drive_test
+        # (Float64, -1..1). Fresh + nonzero takes priority over /cmd_vel and
+        # bypasses the torque map + steering. Always non-FOC (no license).
+        self._test_duty = 0.0
+        self._test_time = 0.0
+        self.create_subscription(
+            Float64, TOPIC_DRIVE_TEST, self._on_test, 10)
+        # Bench test: direct target ROAD-WHEEL angle in degrees on
+        # /ethon/steer_test_deg (Float64). Fresh takes priority over the
+        # Ackermann-computed angle and bypasses the armed hand-back rule --
+        # same bench-test intent as /ethon/drive_test, wheels OFF the ground.
+        self._steer_test_deg = 0.0
+        self._steer_test_time = 0.0
+        self.create_subscription(
+            Float64, TOPIC_STEER_TEST, self._on_steer_test, 10)
+
+        # Manual-drive pedal (see PEDAL_PORT above). Non-fatal if absent --
+        # the pedal is optional hardware, not something the node depends on
+        # to come up. Opened non-blocking (timeout=0), same pattern as
+        # PicoLink in wheel_bridge.py.
+        self._pedal_frac = 0.0
+        self._pedal_time = 0.0
+        self._pedal_rx = bytearray()
+        self._pedal_ser = None
+        try:
+            self._pedal_ser = serial.Serial(PEDAL_PORT, PEDAL_BAUD, timeout=0)
+            log.info("pedal link open on %s" % PEDAL_PORT)
+        except (serial.SerialException, OSError) as exc:
+            log.warning(
+                "pedal link not available (%s: %s) -- manual-drive pedal "
+                "inert, everything else unaffected" % (PEDAL_PORT, exc))
+
+        # Wheel brake button (see TOPIC_BRAKE above).
+        self._brake_time = 0.0
+        self.create_subscription(Bool, TOPIC_BRAKE, self._on_brake, 10)
+
+        # Wheel reverse button (see TOPIC_REVERSE above).
+        self._reverse_time = 0.0
+        self.create_subscription(Bool, TOPIC_REVERSE, self._on_reverse, 10)
+        # net battery energy + distance integrators for the efficiency readout
+        self._energy_wh = 0.0
+        self._dist_m = 0.0
+        self._energy_last_t = None
+        self.create_timer(1.0 / TICK_HZ, self._tick)
+        self.create_timer(1.0 / STATUS_HZ, self._publish_status)
+
+        log.info(
+            f"ethon_drive up — bus '{self.can_bus}', steering "
+            f"{'ENABLED' if self.steer_enabled else 'DISABLED (drive-only)'}, "
+            f"{'CONFIG HOLD (no motion)' if self.config_hold else 'ready'}, "
+            f"waiting for {TOPIC_CMD_VEL}")
+
+    # ── startup ──────────────────────────────────────────────────────────
+
+    def _home_steering(self) -> bool:
+        """Seed the steering rotor position from the column CANcoder.
+
+        The CANcoder absolute range is +/-0.5 rotation, so homing is only
+        unambiguous when the column is within half a turn of centre at boot
+        — park the car with the wheels roughly straight.
+        """
+        cfg, log = self.cfg, self.get_logger()
+        try:
+            enc = CANcoder(cfg.cancoder_can_id, self.can_bus)
+            sig = enc.get_absolute_position()
+            sig.wait_for_update(SIGNAL_PROBE_TIMEOUT_S)
+            if not sig.status.is_ok():
+                log.warning(
+                    f"CANcoder {cfg.cancoder_can_id} not responding "
+                    f"({sig.status.name})")
+                return False
+            raw = float(sig.value)
+        except Exception as exc:
+            log.warning(f"CANcoder probe failed: {exc}")
+            return False
+
+        col_rot = (-raw if cfg.cancoder_invert else raw) - cfg.cancoder_offset_rot
+        for attempt in range(1, CONFIG_APPLY_RETRIES + 1):
+            try:
+                status = self.steer.set_position(col_rot * cfg.steer_belt_ratio)
+                if status.is_ok():
+                    log.info(
+                        f"steering homed from CANcoder: column at "
+                        f"{col_rot:+.3f} rot from centre")
+                    return True
+                log.warning(
+                    f"steer set_position attempt {attempt}: {status.name}")
+            except Exception as exc:
+                log.warning(f"steer set_position attempt {attempt}: {exc}")
+            time.sleep(0.1)
+        return False
+
+    def _home_lock_to_lock(self) -> bool:
+        """Home the steering on the mechanical stops, then park at centre.
+
+        Sequence: sweep RIGHT until the rotor stalls against the stop, record
+        it; sweep LEFT the same way; centre = midpoint of the two; re-zero the
+        encoder there and drive back to it; soft limits come from the measured
+        half-range minus a margin.
+
+        Runs open-loop DutyCycleOut with FOC disabled (no Pro licence needed).
+        The torque it can push into a stop is bounded by the stator current
+        limit, which is dropped to ``steer_home_current_a`` for the sweep and
+        restored to ``steer_max_a`` afterwards — low enough that stalling
+        cannot hurt the belt/pulleys/column and a hand on the wheel always
+        wins. All thresholds are vehicle.yaml params (steer_home_*).
+
+        The device soft limits are DISABLED for the duration: at power-on the
+        rotor zero is arbitrary (no CANcoder), so a pre-homing soft limit can
+        halt the sweep short of the real stop and record a false lock. They are
+        re-applied from the measured range by the caller.
+
+        !! UNTESTED ON HARDWARE !! Verify with the wheels off the ground and a
+        hand ready. A stall threshold too high reads a false stop mid-travel;
+        too low never triggers.
+        """
+        log = self.get_logger()
+        cfg = self.cfg
+        vel = self.steer.get_velocity()
+        pos = self.steer.get_position()
+        period = 1.0 / STEER_HOME_RATE_HZ
+        right = 1.0 if float(cfg.steer_home_right_sign) >= 0 else -1.0
+
+        _cc_sig = None
+        try:
+            from phoenix6.hardware import CANcoder as _CC
+            _cc = _CC(5, self.can_bus)
+            _cc_sig = _cc.get_absolute_position()
+        except Exception as _exc:
+            log.warn("    [cancoder trace] probe setup failed: %s" % _exc)
+
+        def _set_stator_limit(amps, tag):
+            """Temporarily re-limit stator current (bounds stall torque)."""
+            c = TalonFXConfiguration()
+            c.motor_output.inverted = (
+                InvertedValue.CLOCKWISE_POSITIVE if cfg.steer_inverted
+                else InvertedValue.COUNTER_CLOCKWISE_POSITIVE)
+            c.software_limit_switch.forward_soft_limit_enable = False
+            c.software_limit_switch.reverse_soft_limit_enable = False
+            c.torque_current.peak_forward_torque_current = amps
+            c.torque_current.peak_reverse_torque_current = -amps
+            c.current_limits.stator_current_limit = amps
+            c.current_limits.stator_current_limit_enable = True
+            return apply_device_config(self.steer, c, tag, log)
+
+        def find_stop(direction, name):
+            req = DutyCycleOut(direction * float(cfg.steer_home_duty),
+                               enable_foc=False)
+            below_since = None
+            t0 = time.monotonic()
+            n = 0
+            while time.monotonic() - t0 < float(cfg.steer_home_timeout_s):
+                unmanaged.feed_enable(FEED_ENABLE_S)
+                self.steer.set_control(req)
+                time.sleep(period)
+                vel.refresh()
+                n += 1
+                if n % 10 == 0:
+                    pos.refresh()
+                    cc_str = "n/a"
+                    if _cc_sig is not None:
+                        _cc_sig.refresh()
+                        cc_str = "%+.5f" % float(_cc_sig.value)
+                    log.warn("    [trace %s] t=%.2f pos=%+.3f vel=%+.4f cc=%s below_since=%s"
+                              % (name, time.monotonic() - t0, float(pos.value),
+                                 float(vel.value), cc_str,
+                                 "%.2f" % (time.monotonic() - below_since) if below_since else "None"))
+                if abs(float(vel.value)) < float(cfg.steer_home_stall_rps):
+                    if below_since is None:
+                        below_since = time.monotonic()
+                    elif (time.monotonic() - below_since
+                          >= float(cfg.steer_home_stall_s)):
+                        self.steer.set_control(self._neutral)
+                        pos.refresh()
+                        p = float(pos.value)
+                        log.warn("  %s stop found at %+.3f rotor rot" % (name, p))
+                        return p
+                else:
+                    below_since = None
+            self.steer.set_control(self._neutral)
+            log.error("  %s stop NOT found within %.1fs"
+                      % (name, float(cfg.steer_home_timeout_s)))
+            return None
+
+        def drive_to(target):
+            """Creep back to centre under the same current-limited duty.
+
+            Stops on arrival, on overshoot (error changes sign — no point
+            hunting back and forth at open-loop duty), or on timeout.
+            """
+            t0 = time.monotonic()
+            sign0 = None
+            while time.monotonic() - t0 < STEER_HOME_CENTRE_TIMEOUT_S:
+                pos.refresh()
+                err = target - float(pos.value)
+                if abs(err) <= STEER_HOME_CENTRE_TOL_ROT:
+                    self.steer.set_control(self._neutral)
+                    return True
+                s = 1.0 if err > 0 else -1.0
+                if sign0 is None:
+                    sign0 = s
+                elif s != sign0:            # crossed the target — close enough
+                    self.steer.set_control(self._neutral)
+                    return True
+                unmanaged.feed_enable(FEED_ENABLE_S)
+                self.steer.set_control(
+                    DutyCycleOut(float(cfg.steer_home_duty) * s,
+                                 enable_foc=False))
+                time.sleep(period)
+            self.steer.set_control(self._neutral)
+            return False
+
+        home_a = float(cfg.steer_home_current_a)
+        log.warn("steering lock-to-lock homing at %.1f A / %.2f duty — "
+                 "RIGHT then LEFT then centre. KEEP CLEAR, hand ready."
+                 % (home_a, float(cfg.steer_home_duty)))
+        if not _set_stator_limit(home_a, "steer homing current"):
+            log.error("could not apply homing current limit — homing ABORTED, "
+                      "steering DISABLED (refusing to sweep uncapped).")
+            return False
+        try:
+            r = find_stop(right, "RIGHT")
+            time.sleep(STEER_HOME_SETTLE_S)
+            l = find_stop(-right, "LEFT") if r is not None else None
+            self.steer.set_control(self._neutral)
+            if r is None or l is None:
+                log.error("lock-to-lock homing FAILED — did not find both "
+                          "stops (right=%s left=%s). Steering DISABLED." % (r, l))
+                return False
+
+            centre = (r + l) / 2.0
+            half_rotor = abs(r - l) / 2.0
+            margin_rotor = (float(cfg.steer_home_margin_rot)
+                            * cfg.steer_belt_ratio)
+            self._steer_lock_half_rotor = max(0.0, half_rotor - margin_rotor)
+            half_col = (self._steer_lock_half_rotor / cfg.steer_belt_ratio
+                        if cfg.steer_belt_ratio else 0.0)
+            min_col = float(cfg.steer_home_min_half_rot)
+            if self._steer_lock_half_rotor <= 0.0 or half_col < min_col:
+                log.error(
+                    "homing REJECTED: measured half-range %.3f column rot "
+                    "(%.3f rotor) is below the %.3f plausibility floor. A stop "
+                    "was almost certainly found early — check the steering is "
+                    "free to move, lower steer_home_stall_rps, or raise "
+                    "steer_home_stall_s. Steering DISABLED."
+                    % (half_col, self._steer_lock_half_rotor, min_col))
+                self._steer_lock_half_rotor = None
+                return False
+
+            time.sleep(STEER_HOME_SETTLE_S)
+            centred = drive_to(centre)
+            pos.refresh()
+            if _cc_sig is not None:
+                _cc_sig.refresh()
+                log.warn("    [cancoder trace] raw absolute_position AT CENTRE = %+.5f rot"
+                          % float(_cc_sig.value))
+            # re-zero so centre reads 0 regardless of where we stopped
+            self.steer.set_position(float(pos.value) - centre)
+            log.warn("steering homed: RIGHT %+.3f / LEFT %+.3f rotor rot, "
+                     "half-range %.3f rot (%.3f column rot), centred=%s"
+                     % (r, l, self._steer_lock_half_rotor,
+                        self._steer_lock_half_rotor / max(cfg.steer_belt_ratio,
+                                                          1e-6), centred))
+            if not centred:
+                log.warn("  (did not reach centre within %.1fs — zero was set "
+                         "anyway; check the wheel is near straight)"
+                         % STEER_HOME_CENTRE_TIMEOUT_S)
+            return True
+        finally:
+            self.steer.set_control(self._neutral)
+            # always restore the operating current cap, even on failure
+            _set_stator_limit(cfg.steer_max_a, "steer operating current")
+
+    def _log_steering_mode(self, steer_cfg_ok: bool):
+        log = self.get_logger()
+        if self.steer_homed and self.steer_enabled:
+            return  # happy path already logged in _home_steering
+        log.error(BANNER)
+        if not steer_cfg_ok:
+            log.error("*  STEERING CONFIG (15 A cap / soft limits) FAILED TO APPLY")
+            log.error("*  -> DRIVE-ONLY MODE. Fix CAN / device before steering.")
+        elif self.steer_enabled:
+            log.error("*  STEERING UNHOMED — no CANcoder, allow_unhomed_steering")
+            log.error("*  is true. Assuming the wheels are CENTRED right now.")
+            log.error("*  Bench testing only — centre the wheels before boot.")
+            try:
+                self.steer.set_position(0.0)
+            except Exception as exc:
+                log.error(f"*  zero-seed failed: {exc}")
+        else:
+            log.error("*  STEERING NOT HOMED (CANcoder absent/dead) and")
+            log.error("*  allow_unhomed_steering is false -> DRIVE-ONLY MODE.")
+            log.error("*  The steering motor will never be commanded.")
+        log.error(BANNER)
+
+    # ── callbacks ────────────────────────────────────────────────────────
+
+    def _on_cmd(self, msg: Twist):
+        with self._lock:
+            self._cmd = (msg.linear.x, msg.angular.z)
+            self._cmd_time = time.monotonic()
+
+    def _on_armed(self, msg: Bool):
+        """Track the planner's latched armed flag (steering hand-back gate)."""
+        new = bool(msg.data)
+        if new != self._armed:
+            self._armed = new
+            self.get_logger().warning(
+                "ARMED — steering under autonomy control" if new else
+                "DISARMED — steering released to the driver (motor neutral)")
+            if not new and self.steer_enabled:
+                # Let go immediately rather than waiting for the next tick.
+                self._steer_col_out = None
+                try:
+                    self.steer.set_control(self._neutral)
+                except Exception:
+                    pass
+
+    def _on_estop(self, msg: Bool):
+        if msg.data:
+            if not self._estop_latched:
+                self._estop_latched = True
+                self._neutral_all()
+                self.get_logger().error(
+                    "E-STOP RECEIVED — motors neutral, LATCHED OFF until "
+                    "node restart")
+        elif self._estop_latched and not self._estop_clear_logged:
+            self._estop_clear_logged = True
+            self.get_logger().warning(
+                "e-stop cleared on topic, but the latch requires a node "
+                "restart — staying disabled")
+
+    def _on_test(self, msg: Float64):
+        with self._lock:
+            self._test_duty = float(msg.data)
+            self._test_time = time.monotonic()
+
+    def _on_steer_test(self, msg: Float64):
+        with self._lock:
+            self._steer_test_deg = float(msg.data)
+            self._steer_test_time = time.monotonic()
+
+    def _on_brake(self, msg: Bool):
+        if bool(msg.data):
+            with self._lock:
+                self._brake_time = time.monotonic()
+
+    def _on_reverse(self, msg: Bool):
+        # Only True refreshes the watchdog; a False (or the watchdog simply
+        # expiring) both mean "not held" -- either way it just goes stale.
+        if bool(msg.data):
+            with self._lock:
+                self._reverse_time = time.monotonic()
+
+    def _pedal_pump(self):
+        """Non-blocking read of the pedal's newline-delimited ASCII stream.
+
+        Called every tick. Parses only the LAST complete line in whatever
+        arrived since the last pump -- if several samples queued up (a
+        scheduling hiccup), older ones are simply superseded, never queued
+        and replayed late. A partial trailing line is kept for next time.
+        """
+        if self._pedal_ser is None:
+            return
+        try:
+            data = self._pedal_ser.read(256)
+        except (serial.SerialException, OSError) as exc:
+            self.get_logger().warning("pedal link read failed: %s" % exc)
+            self._pedal_ser = None
+            return
+        if not data:
+            return
+        self._pedal_rx.extend(data)
+        lines = self._pedal_rx.split(bytes([10]))
+        self._pedal_rx = bytearray(lines[-1])   # keep any partial tail
+        for line in reversed(lines[:-1]):        # newest complete line wins
+            try:
+                frac = float(line.strip())
+            except ValueError:
+                continue
+            self._pedal_frac = _clamp(frac, 0.0, 1.0)
+            self._pedal_time = time.monotonic()
+            break
+
+    # ── 50 Hz control loop ───────────────────────────────────────────────
+
+    def _tick(self):
+        if self._estop_latched or self.config_hold:
+            return  # no feed_enable -> devices stay disabled
+
+        now = time.monotonic()
+        cfg = self.cfg
+        with self._lock:
+            (v_cmd, omega), t_cmd = self._cmd, self._cmd_time
+            test_duty, test_t = self._test_duty, self._test_time
+            steer_test_deg, steer_test_t =                 self._steer_test_deg, self._steer_test_time
+            brake_t = self._brake_time
+            reverse_t = self._reverse_time
+
+        # ── bench-test override ──
+        # A fresh, nonzero /ethon/drive_test command drives the wheels directly
+        # with open-loop duty cycle, bypassing the torque map and leaving
+        # steering untouched. Always non-FOC, so it works on unlicensed devices.
+        # Same watchdog shape as /cmd_vel: if the dashboard stops re-posting,
+        # this goes stale within TEST_TIMEOUT_S and the motors neutral out.
+        if (now - test_t) <= TEST_TIMEOUT_S and abs(test_duty) > 1e-3:
+            unmanaged.feed_enable(FEED_ENABLE_S)
+            cap = abs(float(self.get_parameter("test_max_duty").value))
+            self.drive.set_control(
+                self._drive_req_duty.with_output(_clamp(test_duty, -cap, cap)))
+            return
+
+        # ── manual-drive pedal ──
+        # Pumped every tick so a freshly-plugged-in pedal is picked up
+        # immediately. Fresh + armed makes the pedal the SOLE authority over
+        # speed this tick, in place of /cmd_vel -- it never publishes to that
+        # topic, so it cannot fight cone_corridor_planner's publishes there
+        # (same reasoning as the drive_test override above, and the wheel's
+        # own debug-encoder warning about exactly that failure mode). Pedal
+        # steering hand-back lives in the steering section below.
+        self._pedal_pump()
+        pedal_active = (now - self._pedal_time) <= PEDAL_TIMEOUT_S
+        brake_active = (now - brake_t) <= BRAKE_TIMEOUT_S
+        # ── wheel brake button — HIGHEST priority, above even the pedal ──
+        # Forces v_cmd to 0, i.e. exactly what the single-pedal torque map
+        # below already does on a released pedal: full regen decelerate.
+        # Same steering hand-back as the pedal (see below).
+        reverse_active = (now - reverse_t) <= REVERSE_TIMEOUT_S
+        if brake_active and self._armed:
+            v_cmd, omega = 0.0, 0.0
+        elif pedal_active and self._armed:
+            if reverse_active:
+                # Hold-to-reverse: the whole pedal travel maps onto the
+                # reduced reverse span, so full pedal is reverse_speed_frac
+                # of max speed (30% -> 2.4 m/s), not 8 m/s backwards.
+                v_cmd = (-self._pedal_frac * cfg.reverse_speed_frac
+                         * cfg.max_speed_ms)
+            else:
+                v_cmd = self._pedal_frac * cfg.max_speed_ms
+            omega = 0.0
+        elif now - t_cmd > cfg.cmd_timeout_s:
+            # Stale command: stop feeding enable — every Kraken neutrals on
+            # its own watchdog within FEED_ENABLE_S. Nothing else to do.
+            return
+
+        unmanaged.feed_enable(FEED_ENABLE_S)
+
+        # ── drive: single-pedal torque mapping ──
+        # Continuous everywhere, including across v_cmd = 0 while rolling:
+        #   speed_err <= deadband            -> drive torque, fading to zero
+        #                                       as the error approaches the
+        #                                       deadband edge
+        #   speed_err >  deadband (rolling)  -> regen, ramping from zero at
+        #                                       the edge to full over
+        #                                       regen_ramp_ms (regardless of
+        #                                       throttle sign — braking never
+        #                                       collapses when the command
+        #                                       crosses into reverse)
+        #   stopped + reverse command        -> capped reverse torque
+        limit = self._thermal_limit()
+        wheel_ms = self._wheel_speed_ms()
+        regen_k = _clamp(
+            float(self.get_parameter("regen_strength").value), 0.2, 1.0)
+        if bool(self.get_parameter("use_foc").value):
+            # FOC path: torque is the actuator, so the map above IS the
+            # controller — the vehicle's own inertia integrates torque into
+            # speed and damps the loop.
+            throttle = _clamp(v_cmd / cfg.max_speed_ms, -1.0, 1.0)
+            speed_err = wheel_ms - v_cmd
+            if wheel_ms > ACKERMANN_MIN_SPEED_MS and \
+                    speed_err > cfg.regen_deadband_ms:
+                amps = -min(cfg.regen_a, limit) * regen_k * min(
+                    1.0, (speed_err - cfg.regen_deadband_ms) / cfg.regen_ramp_ms)
+            elif throttle >= 0.0:
+                fade = 1.0 - _clamp(speed_err / cfg.regen_deadband_ms, 0.0, 1.0)
+                amps = throttle * limit * fade
+            else:
+                amps = max(-cfg.reverse_cap, throttle) * limit
+            self.drive.set_control(self._drive_req.with_output(amps))
+        else:
+            # Duty path: duty is a SPEED-like actuator (steady state ~ duty x
+            # free speed), so the torque map must NOT be pushed through it —
+            # its 0.5 m/s fade band becomes a P speed loop with ~36x gain,
+            # which is the surging/jitter this replaced. Instead: feedforward
+            # sized by the measured speed-per-duty, plus a gentle P trim.
+            # Continuous through zero error; lifting off drops v_cmd, the
+            # error goes negative and the same law brakes — same single-pedal
+            # feel, but braking gets a steeper gain and its own LOW cap
+            # (negative duty while rolling is plugging, harsher per duty than
+            # regen current, and it is what made lift-off buck).
+            err = v_cmd - wheel_ms
+            kv = max(float(self.get_parameter("duty_kv_ms").value), 0.1)
+            kp = (float(self.get_parameter("duty_kp").value) if err >= 0.0
+                  else float(self.get_parameter("duty_brake_kp").value)
+                  * regen_k)
+            duty = v_cmd / kv + kp * err
+            hi = limit / max(cfg.max_drive_a, 1.0)   # thermal derate, as a
+                                                     # fraction of full duty
+            lo = -abs(float(self.get_parameter("duty_brake_max").value)) \
+                * regen_k
+            if v_cmd < 0.0 and wheel_ms <= ACKERMANN_MIN_SPEED_MS:
+                # Commanded reverse may exceed the brake cap, up to the same
+                # reverse fraction the torque map allows — but only once the
+                # car is (nearly) stopped or already rolling backwards.
+                # Holding reverse at speed brakes at the normal cap first; it
+                # must not unlock 2x-deep plugging while rolling forward.
+                lo = min(lo, -cfg.reverse_cap * hi)
+            self.drive.set_control(
+                self._drive_req_duty.with_output(_clamp(duty, lo, hi)))
+
+        # ── steering: ackermann -> column angle -> motor rotations ──
+        if not self.steer_enabled:
+            return
+        steer_test_active = (now - steer_test_t) <= TEST_TIMEOUT_S
+        if steer_test_active:
+            # Bench test: bypasses the hand-back rule (same as drive_test) --
+            # this is a deliberate dashboard command, wheels OFF the ground.
+            col_rot = steer_test_deg * cfg.steer_col_ratio / 360.0
+        else:
+            # HAND-BACK RULE: only hold a steering position while autonomy is
+            # actually driving. While DISARMED the planner still publishes zero
+            # /cmd_vel, so without this the motor would servo to centre and fight
+            # the driver on the wheel. A human is aboard and must always be able
+            # to steer, so release the column to neutral (freewheel) instead.
+            # Also releases whenever the pedal is active (manual drive) even if
+            # armed -- the human hand-steers directly during manual driving,
+            # the motor must not fight them by holding a computed angle.
+            if not self._armed or pedal_active or brake_active:
+                self._steer_col_out = None
+                self.steer.set_control(self._neutral)
+                return
+            # Reference speed for the bicycle model: prefer the command, but
+            # fall back to MEASURED wheel speed so a stop command mid-corner
+            # does not snap the steering to centre while the car is moving.
+            v_ref = v_cmd if abs(v_cmd) > ACKERMANN_MIN_SPEED_MS else wheel_ms
+            if abs(v_ref) > ACKERMANN_MIN_SPEED_MS:
+                road_rad = math.atan(cfg.wheelbase_m * omega / v_ref)
+            else:
+                road_rad = 0.0
+            col_rot = math.degrees(road_rad) * cfg.steer_col_ratio / 360.0
+        # Clamp to the MEASURED lock-to-lock half-range when homing found one,
+        # otherwise to the configured soft limit. Commanding past the real stop
+        # just stalls the motor against it.
+        col_limit = cfg.steer_limit_rot
+        if (self._steer_lock_half_rotor is not None and cfg.steer_belt_ratio):
+            col_limit = self._steer_lock_half_rotor / cfg.steer_belt_ratio
+        col_rot = _clamp(col_rot, -col_limit, col_limit)
+        if steer_test_active:
+            # Bench tuning wants clean steps — no slew, and drop the slew
+            # state so post-test re-engagement re-seeds from measured position.
+            self._steer_col_out = None
+        else:
+            # Rate-limit the target: the raw Ackermann angle recomputed at
+            # 50 Hz dithers with every omega/v sample, and a position loop
+            # faithfully chasing that dither is wheel jitter. Slew from the
+            # MEASURED column position on engage so there is never a snap.
+            if self._steer_col_out is None:
+                meas = signal_value(self.steer, "get_position")
+                seed = (meas / cfg.steer_belt_ratio
+                        if meas is not None and cfg.steer_belt_ratio
+                        else col_rot)
+                self._steer_col_out = _clamp(seed, -col_limit, col_limit)
+            step = abs(float(
+                self.get_parameter("steer_slew_col_rps").value)) / TICK_HZ
+            self._steer_col_out += _clamp(
+                col_rot - self._steer_col_out, -step, step)
+            col_rot = self._steer_col_out
+        rotor_target = col_rot * cfg.steer_belt_ratio
+        # Same toggle as the drive motors: FOC needs a Pro licence, the duty
+        # path does not. Gains live in separate slots so no retuning is needed
+        # when flipping the switch.
+        if bool(self.get_parameter("use_foc").value):
+            self.steer.set_control(self._steer_req.with_position(rotor_target))
+        else:
+            self.steer.set_control(
+                self._steer_req_duty.with_position(rotor_target))
+
+    def _thermal_limit(self) -> float:
+        """Linear current derate from the hottest drive motor temperature."""
+        cfg = self.cfg
+        t = max(m.get_device_temp().value
+                for m in [self.drive] + self.followers)
+        if t <= cfg.derate_lo_c:
+            return cfg.max_drive_a
+        if t >= cfg.derate_hi_c:
+            return cfg.min_drive_a
+        frac = (t - cfg.derate_lo_c) / (cfg.derate_hi_c - cfg.derate_lo_c)
+        return cfg.max_drive_a - frac * (cfg.max_drive_a - cfg.min_drive_a)
+
+    def _wheel_speed_ms(self) -> float:
+        rps = self.drive.get_velocity().value / self.cfg.gear_ratio
+        return rps * math.pi * self.cfg.wheel_dia_m
+
+    # ── 2 Hz status publisher ────────────────────────────────────────────
+
+    def _motor_table(self):
+        rows = [(f"drive_{self.drive.device_id}", self.drive)]
+        rows += [(f"drive_{f.device_id}", f) for f in self.followers]
+        rows.append(("steer", self.steer))
+        return rows
+
+    def _publish_status(self):
+        cfg = self.cfg
+        with self._lock:
+            t_cmd = self._cmd_time
+        cmd_age = (time.monotonic() - t_cmd) if t_cmd > 0.0 else None
+        fresh = cmd_age is not None and cmd_age <= cfg.cmd_timeout_s
+
+        if not self.steer_enabled:
+            steering = "disabled"
+        elif self.steer_homed:
+            steering = "homed"
+        else:
+            steering = "unhomed-allowed"
+
+        col_rot = signal_value(self.steer, "get_position")
+        if col_rot is not None:
+            col_rot /= cfg.steer_belt_ratio
+
+        motors = {}
+        for label, m in self._motor_table():
+            motors[label] = {
+                "temp_c": _round(signal_value(m, "get_device_temp"), 1),
+                "torque_a": _round(signal_value(m, "get_torque_current"), 1),
+                "supply_a": _round(signal_value(m, "get_supply_current"), 1),
+                "vel_rps": _round(signal_value(m, "get_velocity"), 1),
+                "faults": read_faults(m),
+            }
+
+        # ── net energy + efficiency integrators ──
+        # Battery power = pack voltage x total supply current, summed across
+        # every motor. Supply current goes NEGATIVE under regen, so this nets
+        # out recovered charge — i.e. true energy drawn from the pack. Integrated
+        # at STATUS_HZ; absurd dt gaps (scheduling stalls) are skipped so a
+        # hiccup can't inject a huge spurious Wh.
+        # Pack voltage is the same on every motor's supply rail, so read it
+        # from whichever motor actually responds rather than hardcoding the
+        # master — during bench testing only one Kraken may be wired up, and
+        # it's often not the master.
+        supply_v = None
+        for _, m in self._motor_table():
+            supply_v = signal_value(m, "get_supply_voltage")
+            if supply_v is not None:
+                break
+        supply_a = [m["supply_a"] for m in motors.values()
+                    if m["supply_a"] is not None]
+        wheel_ms = self._wheel_speed_ms()
+        now = time.monotonic()
+        if self._energy_last_t is not None:
+            dt = now - self._energy_last_t
+            if 0.0 < dt <= 4.0 / STATUS_HZ:
+                if supply_v is not None and supply_a:
+                    self._energy_wh += supply_v * sum(supply_a) * dt / 3600.0
+                self._dist_m += abs(wheel_ms) * dt
+        self._energy_last_t = now
+        wh_per_km = (self._energy_wh / (self._dist_m / 1000.0)
+                     if self._dist_m >= EFFIC_MIN_DIST_M else None)
+
+        status = {
+            "t": round(time.time(), 2),
+            "can_bus": self.can_bus,
+            "enabled": fresh and not self._estop_latched
+                       and not self.config_hold,
+            "estop_latched": self._estop_latched,
+            "config_hold": self.config_hold,
+            "cmd_age_s": _round(cmd_age),
+            "steering": steering,
+            "wheel_speed_ms": _round(wheel_ms),
+            "thermal_limit_a": _round(self._thermal_limit(), 1),
+            "regen_strength": _round(_clamp(float(
+                self.get_parameter("regen_strength").value), 0.2, 1.0), 2),
+            "use_foc": bool(self.get_parameter("use_foc").value),
+            "test_active": ((time.monotonic() - self._test_time) <= TEST_TIMEOUT_S
+                            and abs(self._test_duty) > 1e-3),
+            "test_duty": _round(self._test_duty, 2),
+            "steer_test_active": (
+                (time.monotonic() - self._steer_test_time) <= TEST_TIMEOUT_S),
+            "steer_test_deg": _round(self._steer_test_deg, 1),
+            "steer_col_rot": _round(col_rot, 3),
+            "road_wheel_deg": _round(
+                col_rot * 360.0 / cfg.steer_col_ratio, 1)
+                if col_rot is not None else None,
+            # Usable travel each side of centre, in COLUMN rotations. After
+            # lock_to_lock homing this is the measured half-range (stops minus
+            # margin); otherwise it is the configured soft limit. Lets the
+            # dashboard show travel against the real lock instead of guessing.
+            "steer_limit_col_rot": _round(
+                (self._steer_lock_half_rotor / cfg.steer_belt_ratio)
+                if (self._steer_lock_half_rotor is not None
+                    and cfg.steer_belt_ratio)
+                else cfg.steer_limit_rot, 3),
+            "steer_limit_deg": _round(
+                ((self._steer_lock_half_rotor / cfg.steer_belt_ratio)
+                 if (self._steer_lock_half_rotor is not None
+                     and cfg.steer_belt_ratio)
+                 else cfg.steer_limit_rot) * 360.0 / cfg.steer_col_ratio, 1)
+                if cfg.steer_col_ratio else None,
+            "steer_homed": bool(self.steer_homed),
+            "steer_mode": ("foc" if bool(self.get_parameter("use_foc").value)
+                           else "duty"),
+            # Direction convention, published so the dashboard can render the
+            # wheel the way it physically turns instead of assuming a sign.
+            "steer_inverted": bool(cfg.steer_inverted),
+            "armed": bool(self._armed),
+            # Geometry for the dashboard's predicted-trajectory overlay: the
+            # bicycle model needs the wheelbase, and the steering envelope
+            # needs the road-wheel angle at full lock.
+            "wheelbase_m": _round(cfg.wheelbase_m, 3),
+            "road_wheel_max_deg": _round(
+                (self._steer_lock_half_rotor / cfg.steer_belt_ratio
+                 if (self._steer_lock_half_rotor is not None
+                     and cfg.steer_belt_ratio) else cfg.steer_limit_rot)
+                * 360.0 / cfg.steer_col_ratio, 1)
+                if cfg.steer_col_ratio else None,
+            "supply_v": _round(supply_v, 1),
+            "energy_wh": _round(self._energy_wh, 1),
+            "wh_per_km": _round(wh_per_km, 0),
+            "dist_m": _round(self._dist_m, 1),
+            "motors": motors,
+        }
+        self._status_pub.publish(
+            String(data=json.dumps(status, separators=(",", ":"))))
+
+    # ── shutdown ─────────────────────────────────────────────────────────
+
+    def _neutral_all(self):
+        for label, m in self._motor_table():
+            try:
+                m.set_control(self._neutral)
+            except Exception as exc:
+                self.get_logger().error(f"failed to neutral {label}: {exc}")
+
+    def shutdown(self):
+        """Neutral every motor exactly once before process exit."""
+        if self._shutdown_done:
+            return
+        self._shutdown_done = True
+        self._estop_latched = True      # stop _tick from re-commanding
+        self._neutral_all()
+        self.get_logger().info("ethon_drive shutdown — all motors neutral")
+
+
+def main():
+    rclpy.init()
+    node = EthonDrive()
+
+    def _on_term(signum, _frame):
+        raise SystemExit(signum)
+
+    # SIGINT is handled by rclpy (KeyboardInterrupt / ExternalShutdown);
+    # SIGTERM (systemd stop) must also reach the neutral-out path below.
+    signal.signal(signal.SIGTERM, _on_term)
+
+    try:
+        rclpy.spin(node)
+    except (KeyboardInterrupt, SystemExit, ExternalShutdownException):
+        pass
+    finally:
+        node.shutdown()
+        node.destroy_node()
+        try:
+            rclpy.shutdown()
+        except Exception:
+            pass  # context may already be down (external shutdown)
+
+
+if __name__ == "__main__":
+    main()

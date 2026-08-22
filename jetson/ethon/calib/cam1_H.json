@@ -1,0 +1,5 @@
+{
+ "undistort": true,
+ "model": "fisheye",
+ "points": 4
+}

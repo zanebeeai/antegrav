@@ -1,0 +1,511 @@
+#!/usr/bin/env python3
+"""Cone-corridor planner for the team 1360 Electrathon EV.
+
+Consumes cone detections (/ethon/cones, PoseArray in base_link: x forward,
+y left, metres, class id smuggled in position.z) and obstacle detections
+(/ethon/obstacles, same convention), builds a midline path between the left
+and right cone walls, and tracks it with pure pursuit.  Publishes /cmd_vel
+(Twist: linear.x m/s, angular.z rad/s = v * curvature) at 20 Hz and the
+planned path on /ethon/path for RViz debugging.
+
+Safety model (fail SILENT, never fail ACTIVE):
+  * Nonzero commands require the ``armed`` parameter to be true AND cones to
+    have been seen continuously for ``arm_vision_time_s`` (rolling gate -- a
+    cone dropout must be re-earned before motion resumes).
+  * No valid cones for more than ``cone_timeout_s`` -> zero /cmd_vel
+    (coast-stop) and a warning.
+  * The obstacle feed (/ethon/obstacles) is part of the motion gate: if it
+    goes stale the planner STOPS (fail closed) -- hazard protection silently
+    disappearing must never let the vehicle keep driving on cones alone.
+  * /ethon/estop true -> zero /cmd_vel, latched until node restart (matches
+    the drive node's latch semantics).
+  * Person / cyclist / animal ahead within ``hazard_slow_range_m`` -> creep
+    speed; within ``hazard_stop_range_m`` -> full stop (with release
+    hysteresis). Hazards far outside the corridor laterally are ignored so
+    spectators along the course do not false-stop the car.
+  * The midline is never extrapolated more than ``max_extrapolation_m`` past
+    the furthest cone.
+  * Only one cone wall visible -> run a fixed ``corridor_half_width_m``
+    offset from that wall.
+
+This node never touches the motors directly; the drive node owns the
+Phoenix 6 watchdog (feed_enable) and treats a silent /cmd_vel as disable.
+"""
+
+import math
+import time
+
+import numpy as np
+import rclpy
+from rclpy.executors import ExternalShutdownException
+from geometry_msgs.msg import PoseArray, PoseStamped, Twist
+from nav_msgs.msg import Path
+from rcl_interfaces.msg import SetParametersResult
+from rclpy.node import Node
+from rclpy.parameter import Parameter
+from rclpy.qos import (DurabilityPolicy, QoSProfile, ReliabilityPolicy)
+from std_msgs.msg import Bool
+
+NODE_NAME = "cone_corridor_planner"
+FRAME_ID = "base_link"            # rear axle centre, x forward, y left
+CONTROL_RATE_HZ = 20.0
+CONES_TOPIC = "/ethon/cones"
+OBSTACLES_TOPIC = "/ethon/obstacles"
+CMD_VEL_TOPIC = "/cmd_vel"
+PATH_TOPIC = "/ethon/path"
+ESTOP_TOPIC = "/ethon/estop"
+HMI_ARM_TOPIC = "/ethon/hmi/arm"   # Nextion arm/disarm soft button (command in)
+HMI_ARMED_TOPIC = "/ethon/hmi/armed"  # authoritative armed STATE out (latched)
+
+# Caps for runtime-settable parameters (absolute, regardless of operator):
+# a fat-fingered `ros2 param set` must not be able to command highway speed.
+PARAM_CAPS = {
+    "target_speed_ms": 8.0,           # matches the drive node's max_speed_ms
+    "hazard_creep_speed_ms": 3.0,
+    "max_cone_range_m": 25.0,
+    "max_lookahead_m": 12.0,
+}
+
+HAZARD_CLASS_IDS = {2, 7, 9}      # ethon_v1: person, cyclist, animal
+PATH_STEP_M = 0.5                 # midline sampling interval
+SMOOTH_WINDOW = 5                 # moving-average window for the midline (odd)
+MIN_PATH_LEN_M = 1.0              # refuse to steer on anything shorter
+OBSTACLE_FRESH_S = 1.0            # ignore obstacle data older than this
+WARN_PERIOD_S = 2.0               # throttle for repeated warnings
+EPS = 1e-6
+NEVER = -1.0e9                    # "stamp" meaning never received
+
+
+class ConeCorridorPlanner(Node):
+    """Midline planner + pure-pursuit tracker for a cone-marked corridor."""
+
+    def __init__(self):
+        super().__init__(NODE_NAME)
+
+        # ---- tunables (all runtime-settable via ros2 param) ----
+        self.p = {}
+        for name, default in (
+            ("armed", False),                # operator gate: ros2 param set ... armed true
+            ("target_speed_ms", 5.0),        # cruise speed on straights
+            ("corridor_half_width_m", 1.5),  # offset when only one wall is visible
+            ("max_cone_range_m", 12.0),      # ignore cones further ahead than this
+            ("max_cone_lateral_m", 6.0),     # ignore cones further sideways than this
+            ("max_extrapolation_m", 5.0),    # max path extension past the last cone
+            ("cone_timeout_s", 1.0),         # cone silence -> coast-stop
+            ("arm_vision_time_s", 2.0),      # continuous cone vision required for motion
+            ("lookahead_gain_s", 0.8),       # lookahead = gain * speed
+            ("min_lookahead_m", 2.0),
+            ("max_lookahead_m", 6.0),
+            ("max_lateral_accel_ms2", 2.0),  # corner speed limit: v = sqrt(a_lat / |kappa|)
+            ("hazard_slow_range_m", 8.0),
+            ("hazard_stop_range_m", 3.0),
+            ("hazard_release_m", 1.0),       # hysteresis past stop range before resuming
+            ("hazard_lateral_margin_m", 0.75),  # corridor margin for hazard relevance
+            ("hazard_creep_speed_ms", 1.5),
+            ("vehicle_width_m", 1.2),        # MEASURE -- corridor narrower than this -> stop
+            ("accel_limit_ms2", 1.5),        # forward slew only; decel is instantaneous
+            ("wheelbase_m", 1.60),           # MEASURE (informational; drive node steers)
+        ):
+            self.declare_parameter(name, default)
+            self.p[name] = self.get_parameter(name).value
+        self.add_on_set_parameters_callback(self._on_params)
+
+        # ---- state ----
+        self._cones = []              # [(x, y)] filtered, base_link
+        self._cone_stamp = NEVER      # monotonic time of last non-empty cone set
+        self._vision_since = None     # monotonic start of continuous cone vision
+        self._obstacles = []          # [(x, y, class_id)]
+        self._obstacle_stamp = NEVER
+        self._motion_enabled = False  # last gate state, for transition logging
+        self._cmd_speed = 0.0         # slew-limited speed command (m/s)
+        self._last_tick = time.monotonic()
+        self._last_path = None        # previous midline, for wall association
+        self._hazard_stopped = False  # stop-band latch (released w/ hysteresis)
+        self._estop = False           # latched until node restart
+
+        # ---- I/O ----
+        self.create_subscription(PoseArray, CONES_TOPIC, self._cones_cb, 10)
+        self.create_subscription(PoseArray, OBSTACLES_TOPIC, self._obstacles_cb, 10)
+        # E-stop arrives both ways: latched transient-local from health_monitor
+        # and plain volatile from manual `ros2 topic pub`. Subscribe to both.
+        self.create_subscription(Bool, ESTOP_TOPIC, self._estop_cb, 10)
+        self.create_subscription(
+            Bool, ESTOP_TOPIC, self._estop_cb,
+            QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
+                       durability=DurabilityPolicy.TRANSIENT_LOCAL))
+        # Nextion HMI arm/disarm button -> drives the 'armed' parameter.
+        self.create_subscription(Bool, HMI_ARM_TOPIC, self._hmi_arm_cb, 10)
+        self._cmd_pub = self.create_publisher(Twist, CMD_VEL_TOPIC, 10)
+        self._path_pub = self.create_publisher(Path, PATH_TOPIC, 10)
+        # Authoritative armed STATE, latched so late-joining UIs (dashboard,
+        # wheel) always read the current value. This is the single source of
+        # truth for "armed" — the drive's `enabled` flag is only about /cmd_vel
+        # freshness and must NOT be used as an arm indicator.
+        self._armed_pub = self.create_publisher(
+            Bool, HMI_ARMED_TOPIC,
+            QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
+                       durability=DurabilityPolicy.TRANSIENT_LOCAL))
+        self._armed_pub.publish(Bool(data=bool(self.p["armed"])))
+        self.create_timer(1.0 / CONTROL_RATE_HZ, self._tick)
+
+        self.get_logger().info(
+            "cone_corridor_planner up -- DISARMED. Enable with: "
+            "ros2 param set /%s armed true" % NODE_NAME)
+
+    # ------------------------------------------------------------------ I/O
+
+    def _on_params(self, params):
+        """Accept runtime parameter updates; log arming changes loudly.
+
+        Validates the whole batch BEFORE applying anything so a rejected set
+        leaves self.p untouched, and clamps selected params to PARAM_CAPS.
+        """
+        staged = {}
+        for prm in params:
+            if prm.name not in self.p:
+                continue
+            if prm.name == "armed":
+                staged[prm.name] = bool(prm.value)
+            elif (isinstance(prm.value, (int, float))
+                  and math.isfinite(prm.value) and prm.value >= 0.0):
+                value = float(prm.value)
+                cap = PARAM_CAPS.get(prm.name)
+                if cap is not None and value > cap:
+                    self.get_logger().warn(
+                        "%s=%.2f exceeds cap %.2f -- clamped"
+                        % (prm.name, value, cap))
+                    value = cap
+                staged[prm.name] = value
+            else:
+                return SetParametersResult(
+                    successful=False,
+                    reason="%s must be a finite non-negative number" % prm.name)
+        self.p.update(staged)
+        if "armed" in staged:
+            self.get_logger().warn("operator set armed=%s" % staged["armed"])
+            self._armed_pub.publish(Bool(data=bool(staged["armed"])))
+        return SetParametersResult(successful=True)
+
+    def _hmi_arm_cb(self, msg):
+        """HMI arm/disarm button -> set the 'armed' parameter.
+
+        Routing through set_parameters (rather than poking self.p directly)
+        reuses the _on_params validation and the loud arming log, so an HMI
+        press and a `ros2 param set` are indistinguishable downstream. E-stop
+        stays latched independently — arming never clears it.
+        """
+        self.set_parameters(
+            [Parameter("armed", Parameter.Type.BOOL, bool(msg.data))])
+
+    def _estop_cb(self, msg):
+        """Latch e-stop: zero output until the node is restarted."""
+        if msg.data and not self._estop:
+            self._estop = True
+            self.get_logger().error(
+                "E-STOP received -- /cmd_vel zeroed, LATCHED until restart")
+
+    def _cones_cb(self, msg):
+        """Store cone positions, rejecting outliers; empty sets do not count as 'seen'."""
+        cones = [
+            (p.position.x, p.position.y) for p in msg.poses
+            if 0.0 < p.position.x <= self.p["max_cone_range_m"]
+            and abs(p.position.y) <= self.p["max_cone_lateral_m"]
+        ]
+        if cones:
+            self._cones = cones
+            self._cone_stamp = time.monotonic()
+
+    def _obstacles_cb(self, msg):
+        self._obstacles = [
+            (p.position.x, p.position.y, int(round(p.position.z)))
+            for p in msg.poses
+        ]
+        self._obstacle_stamp = time.monotonic()
+
+    # ------------------------------------------------------------- planning
+
+    def _split_walls(self, use_reference):
+        """Assign cones to the left/right wall.
+
+        With ``use_reference`` and a usable previous midline, cones are
+        classified by which side of THAT line they fall on -- in a tight
+        corner a left-wall cone can have y < 0 in the vehicle frame, so raw
+        sign-of-y corrupts both walls. Otherwise classify by sign-of-y.
+        """
+        if (use_reference and self._last_path is not None
+                and len(self._last_path) >= 2):
+            px, py = self._last_path[:, 0], self._last_path[:, 1]
+            ref = lambda c: c[1] - float(np.interp(c[0], px, py))
+        else:
+            ref = lambda c: c[1]
+        left = sorted((c for c in self._cones if ref(c) >= 0.0),
+                      key=lambda c: c[0])
+        right = sorted((c for c in self._cones if ref(c) < 0.0),
+                       key=lambda c: c[0])
+        return left, right
+
+    def _build_midline(self):
+        """Build the corridor midline as an (N, 2) array of base_link points.
+
+        Tries the reference-line wall split first (corner-aware), then falls
+        back to a sign-of-y split within the SAME tick if that yields no
+        usable corridor -- so an abrupt geometry change recovers immediately
+        instead of losing a frame, while normal driving stays corner-aware.
+        """
+        have_ref = self._last_path is not None and len(self._last_path) >= 2
+        for use_reference in ((True, False) if have_ref else (False,)):
+            mid = self._midline_from_split(*self._split_walls(use_reference))
+            if mid is not None:
+                return mid
+        if self._cones:   # had cones but no attempt produced a safe corridor
+            self.get_logger().warn(
+                "no usable corridor from %d cones (walls crossed or gap < "
+                "vehicle width) -- refusing to plan" % len(self._cones),
+                throttle_duration_sec=WARN_PERIOD_S)
+        return None
+
+    def _midline_from_split(self, left, right):
+        """Corridor midline from one left/right split, or None if unusable.
+
+        Both walls visible -> average of the interpolated wall lines.
+        One wall visible  -> fixed half-width offset from that wall.
+        """
+        if not left and not right:
+            return None
+
+        max_x = max(c[0] for c in left + right)
+        x_end = min(self.p["max_cone_range_m"],
+                    max_x + self.p["max_extrapolation_m"])
+        # Never extrapolate BACKWARD past the nearest cone either: interp
+        # edge-clamps below the first station, which used to aim the path at
+        # the nearest cone's lateral offset all the way back to the bumper.
+        x_start = max(PATH_STEP_M, min(c[0] for c in left + right))
+        xs = np.arange(x_start, x_end + EPS, PATH_STEP_M)
+        if xs.size < 2:
+            return None
+
+        if left and right:
+            ly, ry = self._wall_y(left, xs), self._wall_y(right, xs)
+            gap = ly - ry
+            if float(np.min(gap)) < self.p["vehicle_width_m"]:
+                return None   # walls crossed / corridor narrower than the car
+            y = 0.5 * (ly + ry)
+        elif left:
+            y = self._wall_y(left, xs) - self.p["corridor_half_width_m"]
+            self.get_logger().warn("only LEFT cone wall visible -- offset mode",
+                                   throttle_duration_sec=WARN_PERIOD_S)
+        else:
+            y = self._wall_y(right, xs) + self.p["corridor_half_width_m"]
+            self.get_logger().warn("only RIGHT cone wall visible -- offset mode",
+                                   throttle_duration_sec=WARN_PERIOD_S)
+
+        if xs.size >= SMOOTH_WINDOW:  # smooth midline with an edge-padded box filter
+            kernel = np.ones(SMOOTH_WINDOW) / SMOOTH_WINDOW
+            y = np.convolve(np.pad(y, SMOOTH_WINDOW // 2, mode="edge"),
+                            kernel, mode="valid")
+        return np.column_stack((xs, y))
+
+    @staticmethod
+    def _wall_y(wall, xs):
+        """Piecewise-linear wall lateral position at stations xs (edge-clamped)."""
+        wx = np.array([c[0] for c in wall])
+        wy = np.array([c[1] for c in wall])
+        return np.interp(xs, wx, wy)
+
+    def _pure_pursuit(self, path):
+        """Return path curvature (1/m, +left) toward the lookahead point, or None."""
+        dists = np.hypot(path[:, 0], path[:, 1])
+        if dists[-1] < MIN_PATH_LEN_M:
+            return None
+        lookahead = min(
+            max(self.p["lookahead_gain_s"] * self._cmd_speed,
+                self.p["min_lookahead_m"]),
+            self.p["max_lookahead_m"], dists[-1])
+        ahead = np.nonzero(dists >= lookahead - EPS)[0]
+        idx = int(ahead[0]) if ahead.size else len(path) - 1
+        tx, ty = float(path[idx, 0]), float(path[idx, 1])
+        d2 = tx * tx + ty * ty
+        if d2 < EPS:
+            return None
+        return 2.0 * ty / d2
+
+    def _plan_speed(self, curvature, path):
+        """Speed target from cruise setting, curvature, and hazard proximity.
+
+        Obstacle-feed freshness is enforced by the motion gate (fail closed);
+        by the time we get here the hazard list is current. Hazards are only
+        acted on when laterally inside the corridor (+ margin) -- a spectator
+        standing beside the course must not stop the car. The stop band has
+        release hysteresis so a person at exactly stop range cannot chatter
+        the command at 20 Hz.
+        """
+        speed = self.p["target_speed_ms"]
+        if abs(curvature) > EPS:
+            speed = min(speed, math.sqrt(
+                self.p["max_lateral_accel_ms2"] / abs(curvature)))
+
+        px, py = path[:, 0], path[:, 1]
+        lateral_bound = (self.p["corridor_half_width_m"]
+                         + self.p["hazard_lateral_margin_m"])
+        stop_range = self.p["hazard_stop_range_m"]
+        if self._hazard_stopped:   # released only past stop + hysteresis, in
+            stop_range += self.p["hazard_release_m"]      # BOTH axes -- a
+            lateral_bound += self.p["hazard_release_m"]   # person edging
+            # sideways while still dead ahead must not un-stop the car.
+
+        hazard_stop = False
+        for x, y, cls in self._obstacles:
+            if cls not in HAZARD_CLASS_IDS or x <= 0.0:
+                continue
+            if abs(y - float(np.interp(x, px, py))) > lateral_bound:
+                continue           # well outside the corridor: do not react
+            dist = math.hypot(x, y)
+            if dist <= stop_range:
+                self.get_logger().warn(
+                    "hazard class %d at %.1f m in corridor -- FULL STOP"
+                    % (cls, dist), throttle_duration_sec=WARN_PERIOD_S)
+                hazard_stop = True
+                break
+            if dist <= self.p["hazard_slow_range_m"]:
+                speed = min(speed, self.p["hazard_creep_speed_ms"])
+                self.get_logger().warn(
+                    "hazard class %d at %.1f m in corridor -- creeping"
+                    % (cls, dist), throttle_duration_sec=WARN_PERIOD_S)
+        self._hazard_stopped = hazard_stop
+        return 0.0 if hazard_stop else speed
+
+    # ------------------------------------------------------- control loop
+
+    def _tick(self):
+        """20 Hz control step: gate checks, plan, track, publish."""
+        now = time.monotonic()
+        dt = max(now - self._last_tick, 0.0)
+        self._last_tick = now
+
+        if self._estop:
+            self.publish_stop()
+            return
+
+        cones_fresh = (now - self._cone_stamp) <= self.p["cone_timeout_s"]
+        if cones_fresh:
+            if self._vision_since is None:
+                self._vision_since = now
+        else:
+            self._vision_since = None
+            self._last_path = None    # stale vision -> old midline unreliable
+
+        path = self._build_midline() if cones_fresh else None
+        if path is not None:
+            self._last_path = path
+            self._publish_path(path)
+
+        vision_ok = (self._vision_since is not None and
+                     now - self._vision_since >= self.p["arm_vision_time_s"])
+        # Obstacle feed is part of the gate: a dead detector must stop the
+        # car (fail closed), not silently disable person/cyclist protection.
+        obstacles_fresh = (now - self._obstacle_stamp) <= OBSTACLE_FRESH_S
+        gate_ok = (bool(self.p["armed"]) and vision_ok
+                   and path is not None and obstacles_fresh)
+        self._log_gate_transition(gate_ok, cones_fresh, vision_ok,
+                                  obstacles_fresh)
+
+        if not gate_ok:
+            if self.p["armed"] and not cones_fresh:
+                self.get_logger().warn(
+                    "no cones for >%.1f s -- coast-stop"
+                    % self.p["cone_timeout_s"],
+                    throttle_duration_sec=WARN_PERIOD_S)
+            elif self.p["armed"] and not obstacles_fresh:
+                self.get_logger().warn(
+                    "obstacle feed stale >%.1f s -- coast-stop (fail closed)"
+                    % OBSTACLE_FRESH_S,
+                    throttle_duration_sec=WARN_PERIOD_S)
+            self.publish_stop()
+            return
+
+        curvature = self._pure_pursuit(path)
+        if curvature is None:
+            self.get_logger().warn("path too short to track -- stopping",
+                                   throttle_duration_sec=WARN_PERIOD_S)
+            self.publish_stop()
+            return
+
+        target = self._plan_speed(curvature, path)
+        if target < self._cmd_speed:   # brake immediately, accelerate gently
+            self._cmd_speed = target
+        else:
+            self._cmd_speed = min(
+                target, self._cmd_speed + self.p["accel_limit_ms2"] * dt)
+
+        cmd = Twist()
+        cmd.linear.x = self._cmd_speed
+        cmd.angular.z = self._cmd_speed * curvature
+        self._cmd_pub.publish(cmd)
+
+    def _log_gate_transition(self, gate_ok, cones_fresh, vision_ok,
+                             obstacles_fresh):
+        """Log loudly whenever the motion gate opens or closes."""
+        if gate_ok == self._motion_enabled:
+            return
+        self._motion_enabled = gate_ok
+        if gate_ok:
+            self.get_logger().info(
+                "ARMED -- motion enabled (armed=true, cones continuous %.1f s)"
+                % self.p["arm_vision_time_s"])
+        else:
+            if not self.p["armed"]:
+                reason = "armed=false"
+            elif not cones_fresh:
+                reason = "cone loss"
+            elif not vision_ok:
+                reason = "vision gate not re-earned"
+            elif not obstacles_fresh:
+                reason = "obstacle feed stale (fail closed)"
+            else:
+                reason = "no usable path"
+            self.get_logger().warn("DISARMED -- motion inhibited (%s)" % reason)
+
+    def publish_stop(self):
+        """Publish a zero Twist and reset the speed slew state."""
+        self._cmd_speed = 0.0
+        self._cmd_pub.publish(Twist())
+
+    def _publish_path(self, pts):
+        """Publish the midline as nav_msgs/Path in base_link for RViz."""
+        msg = Path()
+        msg.header.frame_id = FRAME_ID
+        msg.header.stamp = self.get_clock().now().to_msg()
+        last = len(pts) - 1
+        for i in range(len(pts)):
+            ahead = pts[min(i + 1, last)]
+            behind = pts[max(i - 1, 0)]
+            yaw = math.atan2(ahead[1] - behind[1], ahead[0] - behind[0])
+            ps = PoseStamped()
+            ps.header = msg.header
+            ps.pose.position.x = float(pts[i, 0])
+            ps.pose.position.y = float(pts[i, 1])
+            ps.pose.orientation.z = math.sin(yaw / 2.0)
+            ps.pose.orientation.w = math.cos(yaw / 2.0)
+            msg.poses.append(ps)
+        self._path_pub.publish(msg)
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = ConeCorridorPlanner()
+    try:
+        rclpy.spin(node)
+    except (KeyboardInterrupt, ExternalShutdownException):
+        pass
+    finally:
+        try:                      # last act: explicit stop for the drive node
+            node.publish_stop()
+            node.destroy_node()
+        except Exception:
+            pass
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()

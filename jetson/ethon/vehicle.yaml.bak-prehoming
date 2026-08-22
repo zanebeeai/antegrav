@@ -1,0 +1,92 @@
+# ============================================================================
+# Ethon vehicle configuration — read by ethon_drive.py at startup.
+#
+# DEPLOY TO: /home/jetson/ethon/vehicle.yaml   (this repo copy is the template)
+#
+# Every key overrides the matching built-in default in ethon_drive.py
+# (CONFIG_DEFAULTS). Omitted keys fall back to the defaults, which equal the
+# values shown here. Unknown keys are ignored with a warning. If this file is
+# missing or malformed the node logs it and runs on built-in defaults.
+#
+# !! Keys marked MEASURE are placeholders. Measure them on the car and
+# !! update this file BEFORE the first drive.
+# ============================================================================
+
+# ── CAN ─────────────────────────────────────────────────────────────────────
+# Bus name. Was "canivore" with a probe-then-fallback-to-can0 default, but
+# this project has no CANivore hardware (motors are on the Jetson's native
+# can0/mttcan controller) and the canivore probe raced with the real can0
+# devices on startup, occasionally leaving the node stuck reporting
+# can_bus=canivore with every motor "unavailable" even though can0 was
+# working fine. Hardcoded to can0 (2026-07-04) to remove that whole failure
+# mode. If a CANivore is ever added, set this back to its bus name.
+can_bus: can0
+
+drive_master_id: 1          # Kraken X60, drive master
+drive_follower_ids: [2, 3]  # Kraken X60 drive followers (same orientation)
+steer_can_id: 4             # Kraken X60 on the steering-column belt
+cancoder_can_id: 4          # CANcoder on the column (absolute homing; may be absent)
+
+# ── drivetrain ──────────────────────────────────────────────────────────────
+wheel_dia_m: 0.6604         # 26-inch rear wheel, metres
+gear_ratio: 11.46           # motor rotations per wheel rotation
+max_speed_ms: 8.0           # /cmd_vel linear.x saturation speed, m/s
+drive_inverted: false       # BENCH-VERIFY with wheels off the ground: positive
+                            # /cmd_vel linear.x must roll the car FORWARD.
+                            # Wrong direction -> flip this, never rewire.
+steer_inverted: false       # BENCH-VERIFY: positive angular.z must steer LEFT
+max_drive_a: 80.0           # full TorqueCurrentFOC drive current (cool motors)
+min_drive_a: 50.0           # derated current at/above derate_hi_c
+derate_lo_c: 55.0           # derate begins at this hottest-motor temp, C
+derate_hi_c: 70.0           # derate fully applied at this temp, C
+reverse_cap: 0.30           # reverse torque as a fraction of the derated limit
+regen_a: 40.0               # max regen braking current (single-pedal lift-off)
+regen_deadband_ms: 0.5      # wheel speed must exceed command by this (m/s) before regen
+regen_ramp_ms: 2.0          # speed error (m/s) at which regen reaches full current
+
+# control mode. true = TorqueCurrentFOC (precise closed-loop current control,
+# but requires a Phoenix Pro license PER DEVICE); false = DutyCycleOut, open-
+# loop, works on unlicensed devices. Live-toggleable from the dashboard, so
+# this is just the boot default. Currently false because the Krakens are not
+# Pro-licensed for non-FRC use — flip to true if/when that is resolved.
+use_foc: false
+test_max_duty: 0.30         # dashboard bench-test duty-cycle safety cap (fraction)
+
+# ── steering ────────────────────────────────────────────────────────────────
+wheelbase_m: 1.524          # MEASURE — rear axle to front axle, metres
+steer_col_ratio: 12.0       # MEASURE — steering-wheel degrees per road-wheel degree
+steer_belt_ratio: 4.0       # MEASURE — motor rotations per steering-column rotation
+steer_limit_rot: 1.0        # MEASURE — soft limit, +/- steering-column rotations
+steer_max_a: 15.0           # torque cap — the DRIVER MUST BE ABLE TO OVERPOWER
+                            # the motor by hand. Do not raise without re-testing
+                            # hand-overpower on the bench.
+# homing method:
+#   cancoder      seed the rotor from the absolute CANcoder at boot (needs the
+#                 CANcoder + cancoder_offset_rot; park wheels straight).
+#   lock_to_lock  sweep to both mechanical stops, centre on the midpoint, and
+#                 derive the soft limits from the measured range (no CANcoder
+#                 or offset needed). UNTESTED — bench-verify with a hand on the
+#                 wheel and tune STEER_HOME_* in ethon_drive.py before trusting.
+steer_home_method: cancoder
+cancoder_offset_rot: 0.0    # MEASURE — CANcoder absolute reading (rotations,
+                            # after cancoder_invert) with the wheels dead centre.
+                            # NOTE: absolute range is +/-0.5 rot, so homing is
+                            # only valid if the car boots within half a column
+                            # turn of centre — park with the wheels straight.
+cancoder_invert: false      # true if the CANcoder counts opposite to the motor
+
+allow_unhomed_steering: false
+# ^ behaviour when the CANcoder is absent/dead at boot:
+#     false -> DRIVE-ONLY mode: the steering motor is never commanded. [safe]
+#     true  -> assume the wheels are centred at boot and steer anyway.
+#              ONLY for bench testing with the wheels centred by hand.
+
+# ── safety ──────────────────────────────────────────────────────────────────
+geometry_measured: true    # GATE: set true ONLY after every MEASURE key above
+                            # has been filled in from the real car. While false
+                            # (or if this file is missing/unreadable) the node
+                            # starts in CONFIG HOLD and never commands motors.
+
+# ── timing ──────────────────────────────────────────────────────────────────
+cmd_timeout_s: 0.25         # /cmd_vel older than this -> enable not fed -> motors
+                            # disable on the Phoenix watchdog within ~100 ms

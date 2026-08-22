@@ -1,0 +1,883 @@
+#!/usr/bin/env python3
+"""Steering-wheel bridge: Jetson ROS2 <-> Pico wheel hub (USB), for team 1360.
+
+Supersedes nextion_hmi.py AND led_lights.py once the wheel electronics move to a
+Raspberry Pi Pico (see pico/code.py). The Pico owns the physical Nextion UART,
+the NeoPixel strip, and the wheel buttons; this node keeps ALL the dashboard
+rendering and ROS logic and simply moves the bytes over the Pico's framed USB
+link instead of /dev/ttyTHS1.
+
+What changed vs nextion_hmi.py:
+  * NextionLink now writes/reads through a pluggable transport. Here that
+    transport is the Pico's NEXTION channel, so every draw command and touch
+    event is tunnelled over USB. The drawing + hit-testing code is byte-for-byte
+    the same, so the display behaves identically (no .tft, runtime-drawn).
+  * Adds an LED channel: brake intensity is computed from /ethon/drive_status
+    (single-pedal regen, exactly like led_lights.py) and pushed to the Pico,
+    which animates the rear brake/tail + front DRL locally.
+  * Adds a BUTTON channel: physical wheel buttons arrive as tokens and fire the
+    same actions as the on-screen soft buttons.
+
+Subscribes: /ethon/health, /ethon/drive_status, /ethon/estop, /cmd_vel, /ethon/lap
+Publishes:  /ethon/estop (Bool), /ethon/hmi/arm (Bool), /ethon/hmi/mode (String),
+            /ethon/lap/mark (Empty), /cmd_vel (Twist, DEBUG ONLY — see encoder 2 below)
+
+Encoder 2 -> DEBUG drive-speed setpoint. Publishes /cmd_vel directly at 20 Hz
+while nonzero, completely bypassing the planner/autonomy pipeline — for bench
+testing raw drive response (does the Kraken spin, in the right direction, at
+roughly the right speed) without needing cones/vision/armed gates. Capped low
+(2.0 m/s) and forward-only. INERT at zero: nothing is published while the
+setpoint is 0, so it cannot interfere with normal armed/autonomy operation —
+but if you dial it up while the planner is ALSO actively driving, the two
+publishers will fight over /cmd_vel. Only use this with the planner disarmed
+or the stack stopped.
+
+Link protocol (must match pico/code.py exactly):
+  A5 5A | ch(1) | len(2 BE) | payload | crc8(1)   crc8: poly 0x07 init 0x00
+  ch 1 NEXTION (both ways)  ch 2 LED (->Pico)  ch 3 BUTTON (<-Pico)  ch 4 LOG
+"""
+
+import json
+import os
+import signal
+import subprocess
+import time
+
+import rclpy
+from rclpy.executors import ExternalShutdownException
+from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+from std_msgs.msg import Bool, Empty, String
+from geometry_msgs.msg import Twist
+from rcl_interfaces.srv import SetParameters
+from rcl_interfaces.msg import Parameter, ParameterType, ParameterValue
+
+import serial   # python3-serial
+
+# ── Pico link ───────────────────────────────────────────────────────────────
+PICO_PORT = "/dev/ethon-wheel"   # udev symlink to the Pico DATA CDC (see rules)
+PICO_BAUD = 115200               # USB-CDC: value is nominal, framing is ours
+SOF = b"\xA5\x5A"
+CH_NEXTION, CH_LED, CH_BUTTON, CH_LOG = 1, 2, 3, 4
+LED_PUSH_HZ = 20.0               # brake responsiveness (Nextion redraws at 5 Hz)
+
+# ── panel ───────────────────────────────────────────────────────────────────
+SCREEN_W, SCREEN_H = 480, 320
+REFRESH_HZ = 10.0          # dashboard redraw rate (lap time updates this fast)
+FONT = 0
+EOL = b"\xff\xff\xff"
+MODE_SCRIPT = "/home/jetson/ethon/ethon_set_mode.sh"
+CLEAR_ESTOP_SCRIPT = "/home/jetson/ethon/ethon_clear_estop.sh"
+
+# encoder -> planner cruise-speed (target_speed_ms) adjustment
+PLANNER_NODE = "/cone_corridor_planner"
+TARGET_SPEED_DEFAULT = 5.0       # m/s; matches the planner default
+TARGET_SPEED_STEP = 0.5          # m/s per encoder detent
+TARGET_SPEED_MAX = 8.0           # m/s ceiling (planner also clamps)
+
+# encoder 3 -> drive regen (e-brake) strength adjustment
+DRIVE_NODE = "/ethon_drive"
+REGEN_DEFAULT = 1.0
+REGEN_STEP = 0.1                 # per encoder detent
+REGEN_MIN, REGEN_MAX = 0.2, 1.0  # floor matches ethon_drive (only brake!)
+
+# encoder 2 -> DEBUG /cmd_vel speed setpoint (bench testing, bypasses planner)
+DEBUG_SPEED_STEP = 0.1           # m/s per encoder detent
+DEBUG_SPEED_MAX = 2.0            # m/s ceiling — deliberately well under the
+                                  # real max_speed_ms (8.0); forward-only, 0 floor
+DEBUG_SPEED_HZ = 20.0            # publish rate while nonzero (cmd_timeout_s is
+                                  # 0.25s on the drive node, so this is comfortable
+                                  # margin — release the encoder to zero and the
+                                  # setpoint is inert again within one tick)
+
+# ── brake model (single-pedal regen; matches led_lights.py) ─────────────────
+BRAKE_FULL_A = 18.0
+BRAKE_ON_A = 1.5
+BRAKE_FULL_DECEL = 2.5
+
+# ── colours (Nextion 565) ───────────────────────────────────────────────────
+BLACK, WHITE, GREY = 0, 65535, 21130
+RED, GREEN, AMBER, BLUE = 63488, 2016, 64512, 1023
+CYAN, DKRED, DKGREEN, DKGREY = 2047, 38912, 1024, 12678
+
+T_HEALTH, T_DRIVE, T_ESTOP, T_CMDVEL = (
+    "/ethon/health", "/ethon/drive_status", "/ethon/estop", "/cmd_vel")
+T_HMI_ARM, T_HMI_MODE = "/ethon/hmi/arm", "/ethon/hmi/mode"
+T_HMI_ARMED = "/ethon/hmi/armed"   # authoritative armed STATE from the planner
+T_LAP, T_LAP_MARK = "/ethon/lap", "/ethon/lap/mark"
+T_CORRIDOR = "/ethon/corridor"
+CORRIDOR_STALE_S = 2.0           # ignore corridor warnings older than this
+
+SEG = {
+    "0": "abcdef", "1": "bc", "2": "abdeg", "3": "abcdg", "4": "fgbc",
+    "5": "afgcd", "6": "afgcde", "7": "abc", "8": "abcdefg", "9": "abcdfg",
+    "-": "g", " ": "",
+}
+SPEED_W, SPEED_H, SPEED_T, SPEED_GAP = 64, 90, 10, 8
+SPEED_DIGITS = 3
+SPEED_X = (SCREEN_W - (SPEED_DIGITS * SPEED_W + (SPEED_DIGITS - 1) * SPEED_GAP)) // 2
+SPEED_Y = 138
+BAR_W = 16
+BAR_SEGS = 20
+BAR_MAX_KMH = 50.0
+# Battery volts, top-right beside DELTA. Thresholds match the web dashboard's
+# pill/stat card exactly so the two surfaces can never disagree. These are
+# UNDER-LOAD volts: a healthy pack sags well below its ~12.7 V resting figure
+# while the motors pull, so amber under hard acceleration is normal -- a
+# sustained low, or a low at rest, is not.
+VOLT_BAD, VOLT_WARN = 10.5, 11.5
+# Lap-time boxes shrunk 224 -> 130 to free this slot. 130 px still holds a
+# 10-char time ("12:34.567") at the ~13 px/char of font 0; the old 224 was
+# far wider than fmt_lap ever needs.
+LAP_BOX_W = 130
+VOLT_X, VOLT_Y, VOLT_W_BOX, VOLT_H_BOX = 200, 8, 92, 26
+
+
+def crc8(data):
+    crc = 0
+    for b in data:
+        crc ^= b
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0x07) & 0xFF if (crc & 0x80) else (crc << 1) & 0xFF
+    return crc
+
+
+def _clamp(x, lo=0.0, hi=1.0):
+    return lo if x < lo else hi if x > hi else x
+
+
+def draw_digit(nx, x, y, ch, w, h, t, on, off):
+    if ch == " ":
+        nx.fill(x, y, w, h, BLACK)
+        return
+    segs = SEG.get(ch, "")
+    sh = (h - 3 * t) // 2
+    rects = {
+        "a": (x + t, y, w - 2 * t, t),
+        "f": (x, y + t, t, sh),
+        "b": (x + w - t, y + t, t, sh),
+        "g": (x + t, y + t + sh, w - 2 * t, t),
+        "e": (x, y + 2 * t + sh, t, sh),
+        "c": (x + w - t, y + 2 * t + sh, t, sh),
+        "d": (x + t, y + h - t, w - 2 * t, t),
+    }
+    for name, (rx, ry, rw, rh) in rects.items():
+        nx.fill(rx, ry, rw, rh, on if name in segs else off)
+
+
+def fmt_lap(s):
+    if s is None:
+        return "-:--.---"
+    m = int(s // 60)
+    return "%d:%06.3f" % (m, s - 60 * m)
+
+
+def fmt_delta(s):
+    if s is None:
+        return "--"
+    return "%+.3f" % s
+
+
+class PicoLink:
+    """Framed multiplexed USB link to the wheel Pico.
+
+    Exposes a Nextion byte transport (nextion_write / nextion_read) so the
+    unchanged NextionLink can run over it, plus send_led() and a button
+    callback. pump() must be called each cycle to service the serial port.
+    """
+
+    def __init__(self, port, baud, logger, on_button):
+        self._log = logger
+        self._on_button = on_button
+        self._ser = serial.Serial(port, baud, timeout=0)
+        self._rx = bytearray()
+        self._nextion_in = bytearray()
+        self.dead = False        # set on any I/O error -> bridge reconnects
+
+    # framing ------------------------------------------------------------
+    def _send(self, ch, payload):
+        n = len(payload)
+        body = bytes((ch, (n >> 8) & 0xFF, n & 0xFF)) + bytes(payload)
+        try:
+            self._ser.write(SOF + body + bytes((crc8(body),)))
+        except (serial.SerialException, OSError) as exc:
+            self._log.warning("pico write failed: %s" % exc)
+            self.dead = True
+
+    def pump(self):
+        try:
+            data = self._ser.read(4096)
+        except (serial.SerialException, OSError) as exc:
+            self._log.warning("pico read failed: %s" % exc)
+            self.dead = True
+            return
+        if data:
+            self._rx.extend(data)
+        buf = self._rx
+        while True:
+            i = buf.find(SOF)
+            if i < 0:
+                if len(buf) > 4096:
+                    del buf[:-1]
+                break
+            if len(buf) - i < 6:
+                if i:
+                    del buf[:i]
+                break
+            ln = (buf[i + 3] << 8) | buf[i + 4]
+            if ln > 4096:
+                del buf[:i + 2]
+                continue
+            end = i + 5 + ln + 1
+            if len(buf) < end:
+                if i:
+                    del buf[:i]
+                break
+            body = bytes(buf[i + 2:i + 5 + ln])
+            crc = buf[i + 5 + ln]
+            if crc8(body) == crc:
+                ch = buf[i + 2]
+                payload = bytes(buf[i + 5:i + 5 + ln])
+                if ch == CH_NEXTION:
+                    self._nextion_in.extend(payload)
+                elif ch == CH_BUTTON:
+                    self._on_button(payload.decode("ascii", "ignore"))
+                elif ch == CH_LOG:
+                    self._log.info("pico: %s" % payload.decode("ascii", "ignore"))
+            del buf[:end]
+
+    # Nextion transport (consumed by NextionLink) ------------------------
+    def nextion_write(self, data):
+        self._send(CH_NEXTION, data)
+
+    def nextion_read(self, n):
+        if not self._nextion_in:
+            return b""
+        chunk = bytes(self._nextion_in[:n])
+        del self._nextion_in[:n]
+        return chunk
+
+    # LED channel --------------------------------------------------------
+    def send_led(self, brake, estop, armed, front_on, warn=False):
+        self._send(CH_LED, bytes((int(_clamp(brake) * 255),
+                                  1 if estop else 0,
+                                  1 if armed else 0,
+                                  1 if front_on else 0,
+                                  1 if warn else 0)))
+
+    def close(self):
+        try:
+            self._ser.close()
+        except Exception:
+            pass
+
+
+class _NextionPort:
+    """Adapter giving NextionLink a serial-like write/read backed by the Pico."""
+
+    def __init__(self, link):
+        self._link = link
+
+    def write(self, data):
+        self._link.nextion_write(data)
+
+    def read(self, n):
+        return self._link.nextion_read(n)
+
+    def close(self):
+        pass
+
+
+class NextionLink:
+    """Serial link: draw primitives out, raw touch coords in. Transport-agnostic."""
+
+    def __init__(self, io, logger, on_touch):
+        self._io = io
+        self._log = logger
+        self._on_touch = on_touch
+        self._buf = bytearray()
+        self.send("")             # flush partial cmd
+        self.send("bkcmd=0")      # no command ACKs
+        self.send("sendxy=1")     # stream raw touch coords (0x67 frames)
+
+    def send(self, cmd):
+        try:
+            self._io.write(cmd.encode("ascii", "ignore") + EOL)
+        except (serial.SerialException, OSError) as exc:
+            self._log.warning("nextion write failed: %s" % exc)
+
+    def cls(self, color=BLACK):
+        self.send("cls %d" % color)
+
+    def fill(self, x, y, w, h, color):
+        self.send("fill %d,%d,%d,%d,%d" % (x, y, w, h, color))
+
+    def box_text(self, x, y, w, h, text, fg=WHITE, bg=BLACK, big=0):
+        self.send('xstr %d,%d,%d,%d,%d,%d,%d,1,1,1,"%s"'
+                  % (x, y, w, h, big or FONT, fg, bg,
+                     str(text).replace('"', "'")))
+
+    def poll(self):
+        try:
+            data = self._io.read(256)
+        except (serial.SerialException, OSError) as exc:
+            self._log.warning("nextion read failed: %s" % exc)
+            return
+        if not data:
+            return
+        self._buf.extend(data)
+        while True:
+            idx = self._buf.find(EOL)
+            if idx < 0:
+                if len(self._buf) > 64:
+                    del self._buf[:-3]
+                break
+            frame = bytes(self._buf[:idx])
+            del self._buf[: idx + 3]
+            if frame and frame[0] == 0x67 and len(frame) >= 6:
+                x = (frame[1] << 8) | frame[2]
+                y = (frame[3] << 8) | frame[4]
+                self._on_touch(x, y, frame[5])
+
+    def close(self):
+        try:
+            self.send("sendxy=0")
+            self._io.close()
+        except Exception:
+            pass
+
+
+class WheelBridge(Node):
+    def __init__(self):
+        super().__init__("wheel_bridge")
+        log = self.get_logger()
+
+        # cached state
+        self._speed = 0.0
+        self._armed = False
+        self._estop = False
+        self._energy_wh = None
+        self._wh_per_km = None
+        self._temp_c = None
+        self._supply_v = None
+        self._mode = "capture"
+        self._warn = ""
+        self._lap = 0
+        self._cur_s = self._last_s = self._best_s = self._delta_s = None
+        self._line_set = False
+        self._fix = False
+        # brake model state
+        self._supply_a = 0.0
+        self._decel = 0.0
+        self._prev_speed = None
+        self._prev_t = None
+        self._brake = 0.0
+
+        self._shown = {}
+        self._seg_cells = {}
+        self._bar_shown = {}
+
+        bw, by, bh = SCREEN_W // 4, SCREEN_H - 24, 24
+        self._buttons = [
+            (0,        by, bw, bh, "ARM",    "arm"),
+            (bw,       by, bw, bh, "DISARM", "disarm"),
+            (2 * bw,   by, bw, bh, "E-STOP", "estop"),
+            (3 * bw,   by, SCREEN_W - 3 * bw, bh, "MARK", "mark"),
+        ]
+        self._mode_hit = (160, SCREEN_H - 52, 158, 24)
+
+        # open the Pico; the Nextion + LEDs + buttons all ride this one link.
+        # Reconnect-safe: if the Pico is absent or its USB re-enumerates (a new
+        # ttyACM), the link is transparently re-opened from _refresh -- no more
+        # frozen screen after a replug or bus hiccup.
+        self._pico = None
+        self._nx = None
+        self._pico_realpath = None
+        self._last_link_try = 0.0
+        if not self._open_pico():
+            log.warning("Pico not on %s yet -- ROS live, retrying" % PICO_PORT)
+
+        latched = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
+                             durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        self._estop_pub = self.create_publisher(Bool, T_ESTOP, latched)
+        self._arm_pub = self.create_publisher(Bool, T_HMI_ARM, 10)
+        self._mode_pub = self.create_publisher(String, T_HMI_MODE, 10)
+        self._mark_pub = self.create_publisher(Empty, T_LAP_MARK, 10)
+        # encoder -> planner cruise-speed param (service only exists in autonomy)
+        self._target_speed = TARGET_SPEED_DEFAULT
+        self._planner_params = self.create_client(
+            SetParameters, PLANNER_NODE + "/set_parameters")
+        # encoder 3 -> drive regen strength param
+        self._regen = REGEN_DEFAULT
+        self._drive_params = self.create_client(
+            SetParameters, DRIVE_NODE + "/set_parameters")
+        # corridor warning (driver assist): state + stamp for stale-out
+        self._corr_state = "no_path"
+        self._corr_dev = None
+        self._corr_t = 0.0
+        # encoder 2 -> DEBUG /cmd_vel speed setpoint (bypasses the planner;
+        # see the module docstring). Inert at 0 -- _push_debug_speed no-ops.
+        self._debug_speed = 0.0
+        self._debug_cmdvel_pub = self.create_publisher(Twist, T_CMDVEL, 10)
+        self._brake_pub = self.create_publisher(Bool, "/ethon/brake_request", 10)
+        self._reverse_pub = self.create_publisher(Bool, "/ethon/reverse_request", 10)
+        self._reverse_held = False
+        self.create_timer(0.1, self._push_reverse)   # re-publish while held
+
+        self.create_subscription(String, T_HEALTH, self._on_health, 10)
+        self.create_subscription(String, T_DRIVE, self._on_drive, 10)
+        self.create_subscription(Bool, T_ESTOP, self._on_estop, 10)
+        self.create_subscription(Twist, T_CMDVEL, self._on_cmd, 10)
+        self.create_subscription(String, T_LAP, self._on_lap, 10)
+        self.create_subscription(String, T_CORRIDOR, self._on_corridor, 10)
+        # authoritative armed state (latched) -- overrides the immediate
+        # button feedback and reflects arm/disarm from the dashboard too.
+        self.create_subscription(Bool, T_HMI_ARMED, self._on_armed_state, latched)
+        self.create_timer(1.0 / REFRESH_HZ, self._refresh)
+        self.create_timer(1.0 / DEBUG_SPEED_HZ, self._push_debug_speed)
+        self.create_timer(1.0 / LED_PUSH_HZ, self._push_led)
+
+    # ── Pico link (reconnect-safe) ─────────────────────────────────────────
+    def _open_pico(self):
+        """(Re)open the Pico link + Nextion. Returns True on success."""
+        log = self.get_logger()
+        try:
+            pico = PicoLink(PICO_PORT, PICO_BAUD, log, self._on_button)
+        except (serial.SerialException, OSError):
+            return False
+        self._pico = pico
+        self._nx = NextionLink(_NextionPort(pico), log, self._on_touch)
+        try:
+            self._pico_realpath = os.path.realpath(PICO_PORT)
+        except OSError:
+            self._pico_realpath = None
+        # force a full repaint: the panel was reset/blank on (re)connect
+        self._shown = {}
+        self._seg_cells = {}
+        self._bar_shown = {}
+        self._draw_static()
+        log.info("wheel_bridge up on %s (%dx%d)" % (PICO_PORT, SCREEN_W, SCREEN_H))
+        return True
+
+    def _ensure_link(self):
+        """Re-open the Pico if it's missing, has errored, or its port moved
+        (USB re-enumeration). Throttled to ~1 Hz so retries are cheap."""
+        moved = False
+        if self._pico is not None and self._pico_realpath is not None:
+            try:
+                moved = os.path.realpath(PICO_PORT) != self._pico_realpath
+            except OSError:
+                moved = True
+        if self._pico is not None and not self._pico.dead and not moved:
+            return
+        now = time.monotonic()
+        if now - self._last_link_try < 1.0:
+            return
+        self._last_link_try = now
+        if self._pico is not None:
+            try:
+                self._pico.close()
+            except Exception:
+                pass
+            self._pico = None
+            self._nx = None
+        if self._open_pico():
+            self.get_logger().info("wheel_bridge: Pico link re-established")
+
+    # ── static chrome ──────────────────────────────────────────────────────
+    def _draw_static(self):
+        nx = self._nx
+        nx.cls(BLACK)
+        nx.box_text(BAR_W + 4, 4, 44, 22, "CUR", GREY, BLACK)
+        nx.box_text(BAR_W + 4, 30, 44, 22, "LAST", GREY, BLACK)
+        nx.box_text(BAR_W + 4, 56, 44, 22, "BEST", GREY, BLACK)
+        nx.box_text(300, 8, 78, 26, "DELTA", GREY, BLACK)
+        nx.box_text(SCREEN_W // 2 - 40, SPEED_Y + SPEED_H + 2, 80, 22,
+                    "KMH", GREY, BLACK)
+        for (x, y, w, h, label, _a) in self._buttons:
+            nx.fill(x + 1, y + 1, w - 2, h - 2, DKGREY)
+            nx.box_text(x + 1, y + 1, w - 2, h - 2, label, WHITE, DKGREY)
+
+    # ── topic callbacks ────────────────────────────────────────────────────
+    def _on_cmd(self, m):
+        self._speed = abs(m.linear.x)
+
+    def _on_estop(self, m):
+        if m.data:
+            self._estop = True
+
+    def _on_health(self, m):
+        try:
+            d = json.loads(m.data)
+        except (ValueError, TypeError):
+            return
+        a = d.get("alerts") or []
+        self._warn = "" if not a else str(a[0])[:24]
+
+    def _on_drive(self, m):
+        try:
+            d = json.loads(m.data)
+        except (ValueError, TypeError):
+            return
+        ws = d.get("wheel_speed_ms")
+        now = self.get_clock().now().nanoseconds * 1e-9
+        if isinstance(ws, (int, float)):
+            spd = abs(ws)
+            if self._prev_t is not None:
+                dt = now - self._prev_t
+                if 0.0 < dt < 2.0:
+                    self._decel = max(0.0, (self._prev_speed - spd) / dt)
+            self._prev_speed, self._prev_t = spd, now
+            self._speed = spd
+        # NOTE: do NOT set self._armed from drive_status "enabled" -- that flag
+        # is /cmd_vel freshness, not arm state (the planner publishes zero
+        # cmd_vel even while disarmed, so it stays true). Arm state comes from
+        # the latched /ethon/hmi/armed topic (see _on_armed_state).
+        self._energy_wh = d.get("energy_wh")
+        self._wh_per_km = d.get("wh_per_km")
+        amps = [v.get("supply_a") for v in (d.get("motors") or {}).values()
+                if isinstance(v, dict) and isinstance(v.get("supply_a"), (int, float))]
+        if amps:
+            self._supply_a = sum(amps)
+        temps = [v.get("temp_c") for v in (d.get("motors") or {}).values()
+                 if isinstance(v, dict) and isinstance(v.get("temp_c"), (int, float))]
+        self._temp_c = max(temps) if temps else None
+        sv = d.get("supply_v")
+        self._supply_v = sv if isinstance(sv, (int, float)) else None
+
+    def _on_armed_state(self, m):
+        self._armed = bool(m.data)
+
+    def _on_corridor(self, m):
+        try:
+            d = json.loads(m.data)
+        except (ValueError, TypeError):
+            return
+        self._corr_state = d.get("state", "no_path")
+        self._corr_dev = d.get("dev_m")
+        self._corr_t = time.monotonic()
+
+    def _on_lap(self, m):
+        try:
+            d = json.loads(m.data)
+        except (ValueError, TypeError):
+            return
+        self._lap = d.get("lap", 0)
+        self._cur_s = d.get("cur_s")
+        self._last_s = d.get("last_s")
+        self._best_s = d.get("best_s")
+        self._delta_s = d.get("delta_s")
+        self._line_set = bool(d.get("line_set"))
+        self._fix = bool(d.get("fix"))
+
+    # ── brake intensity (single-pedal regen + deceleration) ────────────────
+    def _brake_level(self):
+        regen = max(0.0, -self._supply_a) - BRAKE_ON_A
+        b_regen = _clamp(regen / max(1e-3, BRAKE_FULL_A - BRAKE_ON_A))
+        b_decel = _clamp(self._decel / BRAKE_FULL_DECEL)
+        return max(b_regen, b_decel)
+
+    def _corr_warning(self):
+        """True while the corridor node reports the car meaningfully off line."""
+        return (self._corr_state in ("warn", "off")
+                and time.monotonic() - self._corr_t < CORRIDOR_STALE_S)
+
+    def _push_led(self):
+        if self._pico is None or self._pico.dead:
+            return
+        self._brake = self._brake_level()
+        self._pico.send_led(self._brake, self._estop, self._armed, True,
+                            warn=self._corr_warning())
+
+    # ── buttons (physical, from the Pico) -> same actions as soft buttons ──
+    def _on_button(self, token):
+        if token == "mode":
+            self._fire("mode",
+                       "autonomy" if self._mode == "capture" else "capture")
+        elif token in ("arm", "disarm", "estop", "mark", "estop_clear"):
+            self._fire(token, None)
+        elif token == "enc+":
+            self._adjust_target_speed(TARGET_SPEED_STEP)
+        elif token == "enc-":
+            self._adjust_target_speed(-TARGET_SPEED_STEP)
+        elif token == "e3+":
+            self._adjust_regen(REGEN_STEP)
+        elif token == "e3-":
+            self._adjust_regen(-REGEN_STEP)
+        elif token == "e2+":
+            self._adjust_debug_speed(DEBUG_SPEED_STEP)
+        elif token == "e2-":
+            self._adjust_debug_speed(-DEBUG_SPEED_STEP)
+        elif token == "brake":
+            # Momentary brake pulse from any of the 3 encoder push-buttons --
+            # forces the drive motors to full regen-decelerate for a bounded
+            # window (see BRAKE_TIMEOUT_S in ethon_drive.py), top priority,
+            # above even the manual-drive pedal. Re-press to extend it.
+            self._brake_pub.publish(Bool(data=True))
+            self.get_logger().info("wheel BRAKE button pressed")
+        elif token == "reverse_on":
+            self._reverse_held = True
+            self._reverse_pub.publish(Bool(data=True))
+            self.get_logger().info("wheel REVERSE held")
+        elif token == "reverse_off":
+            self._reverse_held = False
+            self._reverse_pub.publish(Bool(data=False))
+            self.get_logger().info("wheel REVERSE released")
+
+    def _push_reverse(self):
+        """Re-publish reverse=True at 10 Hz while held, so ethon_drive's
+        watchdog stays fresh -- if the link drops mid-hold, it fails safe
+        back to forward instead of latching reverse forever."""
+        if self._reverse_held:
+            self._reverse_pub.publish(Bool(data=True))
+
+    def _adjust_target_speed(self, delta):
+        """Encoder detent -> nudge the planner's cruise target (target_speed_ms).
+        The set_parameters service only exists while the planner runs (autonomy);
+        in capture mode the local value still tracks for the next time it's up."""
+        self._target_speed = max(0.0, min(TARGET_SPEED_MAX,
+                                          self._target_speed + delta))
+        self.get_logger().info("wheel target_speed_ms -> %.1f" % self._target_speed)
+        if not self._planner_params.service_is_ready():
+            return
+        req = SetParameters.Request()
+        req.parameters = [Parameter(
+            name="target_speed_ms",
+            value=ParameterValue(type=ParameterType.PARAMETER_DOUBLE,
+                                 double_value=float(self._target_speed)))]
+        self._planner_params.call_async(req)
+
+    def _adjust_regen(self, delta):
+        """Encoder 3 detent -> nudge the drive's regen (e-brake) strength.
+        Floored at REGEN_MIN because regen is the only service brake — the
+        driver must never be able to dial braking to zero from the wheel."""
+        self._regen = max(REGEN_MIN, min(REGEN_MAX, self._regen + delta))
+        self.get_logger().info("wheel regen_strength -> %.1f" % self._regen)
+        if not self._drive_params.service_is_ready():
+            return
+        req = SetParameters.Request()
+        req.parameters = [Parameter(
+            name="regen_strength",
+            value=ParameterValue(type=ParameterType.PARAMETER_DOUBLE,
+                                 double_value=float(self._regen)))]
+        self._drive_params.call_async(req)
+
+    def _adjust_debug_speed(self, delta):
+        """Encoder 2 detent -> nudge the DEBUG /cmd_vel speed setpoint.
+        See the module docstring: this bypasses the planner entirely, is
+        forward-only (floored at 0), and capped well under the real driving
+        max. Turn it back to 0 to make it inert again."""
+        self._debug_speed = max(0.0, min(DEBUG_SPEED_MAX,
+                                         self._debug_speed + delta))
+        self.get_logger().warning(
+            "wheel DEBUG speed setpoint -> %.1f m/s%s" % (
+                self._debug_speed,
+                " (publishing /cmd_vel directly)" if self._debug_speed > 0
+                else " (inert)"))
+
+    def _push_debug_speed(self):
+        """Continuously re-publish the debug setpoint while nonzero, so the
+        drive node's own cmd_timeout_s watchdog is what stops the motors if
+        this node dies -- same safety property /cmd_vel always has, just
+        sourced from the wheel instead of the planner. No-ops at 0 so this
+        never touches /cmd_vel during normal operation."""
+        if self._debug_speed <= 0.0:
+            return
+        cmd = Twist()
+        cmd.linear.x = self._debug_speed
+        self._debug_cmdvel_pub.publish(cmd)
+
+    def _on_touch(self, x, y, state):
+        if state != 0:
+            return
+        for (bx, by, bw, bh, _label, action) in self._buttons:
+            if bx <= x < bx + bw and by <= y < by + bh:
+                self._fire(action, None)
+                return
+        mx, my, mw, mh = self._mode_hit
+        if mx <= x < mx + mw and my <= y < my + mh:
+            self._fire("mode", "autonomy" if self._mode == "capture" else "capture")
+
+    def _fire(self, action, arg):
+        if action == "estop":
+            self._estop_pub.publish(Bool(data=True))
+            self.get_logger().error("wheel E-STOP -> /ethon/estop true")
+        elif action == "arm":
+            self._arm_pub.publish(Bool(data=True))
+            self._armed = True          # immediate on-screen feedback; drive_status
+            self.get_logger().warning("wheel arm requested")   # refines it in autonomy
+        elif action == "disarm":
+            self._arm_pub.publish(Bool(data=False))
+            self._armed = False
+            self.get_logger().warning("wheel disarm requested")
+        elif action == "mark":
+            self._mark_pub.publish(Empty())
+            self.get_logger().warning("wheel MARK -> set GPS start/finish line")
+        elif action == "estop_clear":
+            # drive latches estop until restart -> publish false (clears the
+            # latched topic value) then bounce ethon-stack so the drive re-enables.
+            self._estop_pub.publish(Bool(data=False))
+            self._estop = False
+            self.get_logger().warning(
+                "wheel ESTOP CLEAR (ARM+DISARM held) -> restart ethon-stack")
+            self._clear_estop()
+        elif action == "mode":
+            self._mode = arg
+            self._mode_pub.publish(String(data=arg))
+            self.get_logger().warning("wheel mode -> %s" % arg)
+            self._switch_mode(arg)
+
+    def _switch_mode(self, target):
+        if target not in ("capture", "autonomy"):
+            return
+        try:
+            subprocess.Popen(["sudo", "-n", MODE_SCRIPT, target],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError as exc:
+            self.get_logger().warning("mode switch exec failed: %s" % exc)
+
+    def _clear_estop(self):
+        try:
+            subprocess.Popen(["sudo", "-n", CLEAR_ESTOP_SCRIPT],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError as exc:
+            self.get_logger().warning("estop clear exec failed: %s" % exc)
+
+    # ── render ─────────────────────────────────────────────────────────────
+    def _put(self, key, x, y, w, h, text, fg=WHITE, bg=BLACK):
+        if self._shown.get(key) != (text, fg, bg):
+            self._shown[key] = (text, fg, bg)
+            self._nx.box_text(x, y, w, h, text, fg, bg)
+
+    def _draw_speed(self, kmh):
+        s = "%*d" % (SPEED_DIGITS, min(999, int(round(kmh))))
+        for i, ch in enumerate(s):
+            if self._seg_cells.get(i) == ch:
+                continue
+            self._seg_cells[i] = ch
+            cx = SPEED_X + i * (SPEED_W + SPEED_GAP)
+            draw_digit(self._nx, cx, SPEED_Y, ch,
+                       SPEED_W, SPEED_H, SPEED_T, GREEN, DKGREY)
+
+    def _draw_bar(self, frac):
+        lit = int(round(max(0.0, min(1.0, frac)) * BAR_SEGS))
+        seg_h = SCREEN_H // BAR_SEGS
+        for i in range(BAR_SEGS):
+            on = i < lit
+            if self._bar_shown.get(i) == on:
+                continue
+            self._bar_shown[i] = on
+            y = SCREEN_H - (i + 1) * seg_h
+            if not on:
+                col = DKGREY
+            elif i < BAR_SEGS * 0.6:
+                col = GREEN
+            elif i < BAR_SEGS * 0.85:
+                col = AMBER
+            else:
+                col = RED
+            self._nx.fill(1, y + 1, BAR_W - 2, seg_h - 2, col)
+
+    def _refresh(self):
+        self._ensure_link()            # transparently (re)open the Pico if needed
+        if self._nx is None:
+            return
+        if self._pico is not None:
+            self._pico.pump()          # de-frame Nextion touch bytes first
+        self._nx.poll()
+        kmh = self._speed * 3.6
+
+        self._put("cur", BAR_W + 50, 4, LAP_BOX_W, 24,
+                  fmt_lap(self._cur_s), GREEN)
+        self._put("last", BAR_W + 50, 30, LAP_BOX_W, 24,
+                  fmt_lap(self._last_s), WHITE)
+        self._put("best", BAR_W + 50, 56, LAP_BOX_W, 24,
+                  fmt_lap(self._best_s), CYAN)
+        dcol = GREEN if (self._delta_s is not None and self._delta_s <= 0) else RED
+        self._put("delta", 382, 8, 94, 26, fmt_delta(self._delta_s), dcol)
+        v = self._supply_v
+        if v is None:
+            vtxt, vcol = "-- V", DKGREY
+        else:
+            vtxt = "%.1fV" % v
+            vcol = (RED if v < VOLT_BAD
+                    else (AMBER if v < VOLT_WARN else GREEN))
+        self._put("volts", VOLT_X, VOLT_Y, VOLT_W_BOX, VOLT_H_BOX, vtxt, vcol)
+        self._put("lap", 300, 40, 176, 24, "LAP %d" % self._lap, WHITE)
+        if not self._fix:
+            gps, gcol = "GPS: NO FIX", RED
+        elif not self._line_set:
+            gps, gcol = "GPS: no line", AMBER
+        else:
+            gps, gcol = "GPS: ok", GREEN
+        self._put("gps", 300, 66, 176, 22, gps, gcol)
+
+        self._put("wh", BAR_W + 4, 92, 156, 24,
+                  "-- Wh" if self._energy_wh is None else "%.0f Wh" % self._energy_wh)
+        self._put("whkm", 184, 92, 150, 24,
+                  "-- Wh/km" if self._wh_per_km is None
+                  else "%.0f Wh/km" % self._wh_per_km)
+        self._put("temp", 346, 92, 130, 24,
+                  "-- C" if self._temp_c is None else "%.0f C" % self._temp_c)
+
+        self._draw_speed(kmh)
+        self._draw_bar(kmh / BAR_MAX_KMH)
+        gear = "!" if self._estop else ("D" if self._armed else "N")
+        self._put("gear", BAR_W + 6, SPEED_Y + SPEED_H // 2 - 12, 40, 24,
+                  gear, AMBER)
+
+        if self._estop:
+            state, scol = "E-STOP", RED
+        elif self._armed:
+            state, scol = "ARMED", GREEN
+        else:
+            state, scol = "DISARMED", DKGREY
+        by = SCREEN_H - 52
+        self._put("state", 0, by, 158, 24, state, WHITE, scol)
+        self._put("mode", 160, by, 158, 24, "MODE:" + self._mode.upper(),
+                  BLACK, AMBER)
+        if self._corr_warning():
+            # dev_m = corridor midline's y offset (+ = left of car), so a
+            # positive dev means the CAR sits right of the line
+            side = "R" if (self._corr_dev or 0) > 0 else "L"
+            wtxt = "OFF LINE %s%.1fm" % (side, abs(self._corr_dev or 0.0))
+            self._put("warn", 320, by, SCREEN_W - 320, 24, wtxt[:14],
+                      BLACK, AMBER)
+        else:
+            self._put("warn", 320, by, SCREEN_W - 320, 24,
+                      self._warn[:14] if self._warn else "", WHITE,
+                      DKRED if self._warn else BLACK)
+
+    def shutdown(self):
+        if self._nx is not None:
+            self._nx.cls(BLACK)
+            self._nx.box_text(1, 1, SCREEN_W - 2, 30, "HMI offline", GREY, BLACK)
+            self._nx.close()
+        if self._pico is not None:
+            self._pico.send_led(0.0, False, False, False)   # lights off
+            self._pico.close()
+
+
+def _on_term(signum, _frame):
+    raise SystemExit(signum)
+
+
+def main():
+    rclpy.init()
+    node = WheelBridge()
+    signal.signal(signal.SIGTERM, _on_term)
+    try:
+        rclpy.spin(node)
+    except (KeyboardInterrupt, SystemExit, ExternalShutdownException):
+        pass
+    finally:
+        node.shutdown()
+        node.destroy_node()
+        try:
+            rclpy.shutdown()
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    main()

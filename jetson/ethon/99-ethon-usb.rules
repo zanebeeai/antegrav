@@ -1,0 +1,22 @@
+# 99-ethon-usb.rules — stable names for the USB serial devices on the Jetson.
+#
+# Pins symlinks so wheel_bridge.py (/dev/ethon-wheel) and the GPS always find
+# the right port regardless of ttyACM numbering. The wheel hub matches ANY
+# CircuitPython Pico's data interface (if02) — keep ONLY ONE Pico plugged in, or
+# this is ambiguous. To lock to a specific Pico, add its serial:
+#   ATTRS{serial}=="<UID>"   (find: udevadm info -q property -n /dev/ttyACM0 | grep ID_SERIAL_SHORT)
+#
+# Install: sudo cp 99-ethon-usb.rules /etc/udev/rules.d/ && sudo udevadm control --reload && sudo udevadm trigger
+
+# --- Pico wheel hub (CircuitPython, two CDC interfaces) ---
+SUBSYSTEM=="tty", SUBSYSTEMS=="usb", ATTRS{idVendor}=="239a", ENV{ID_USB_INTERFACE_NUM}=="02", SYMLINK+="ethon-wheel", GROUP="dialout", MODE="0660"
+SUBSYSTEM=="tty", SUBSYSTEMS=="usb", ATTRS{idVendor}=="239a", ENV{ID_USB_INTERFACE_NUM}=="00", SYMLINK+="ethon-wheel-console", GROUP="dialout", MODE="0660"
+
+# --- VK-162 / u-blox 7 GPS ------------------------------------------------
+SUBSYSTEM=="tty", SUBSYSTEMS=="usb", ATTRS{idVendor}=="1546", ATTRS{idProduct}=="01a7", SYMLINK+="ethon-gps", GROUP="dialout", MODE="0660"
+
+# --- Accelerator pedal (XIAO RP2040, potentiometer via ADC) --------------
+# Matched by serial, not vendor ID alone: 2e8a (Raspberry Pi Foundation) is
+# shared by plain Arduino-core RP2040 boards generally, so vendor ID alone
+# would be ambiguous if any other such board is ever plugged in.
+SUBSYSTEM=="tty", SUBSYSTEMS=="usb", ATTRS{serial}=="4250304539333101", SYMLINK+="ethon-pedal", GROUP="dialout", MODE="0660"
