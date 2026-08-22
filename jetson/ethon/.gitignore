@@ -4,6 +4,7 @@ __pycache__/
 
 # Runtime data retained on the Jetson
 capture_data/
+data/raw/
 logs/
 
 # Generated model artifacts are too large for normal Git storage. Keep the
@@ -11,4 +12,3 @@ logs/
 models/*
 !models/README.md
 !models/REMOTE_MANIFEST.sha256
-

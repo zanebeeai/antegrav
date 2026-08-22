@@ -3,16 +3,20 @@
 
 Reads NMEA from /dev/ttyTHS1 @38400 and republishes GGA fixes as
 sensor_msgs/NavSatFix on /gps/fix (best-effort), which lap_timer.py consumes.
-No pynmea2 dependency -- GGA is parsed directly. The M10 interleaves UBX binary
-frames with NMEA; any line that is not a $..GGA sentence is ignored.
+It also publishes GGA fix quality and RMC/VTG course on /ethon/gps_status for
+synchronized data capture. No pynmea2 dependency; supported sentences are
+parsed directly while interleaved UBX binary frames are ignored.
 """
+import json
 import signal
+import time
 
 import rclpy
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import NavSatFix, NavSatStatus
+from std_msgs.msg import String
 
 import serial   # python3-serial
 
@@ -20,6 +24,7 @@ PORT = "/dev/ttyTHS1"
 BAUD = 38400
 FRAME_ID = "gps"
 TOPIC = "/gps/fix"
+STATUS_TOPIC = "/ethon/gps_status"
 
 
 def _dm_to_deg(val, hemi):
@@ -52,8 +57,17 @@ class GpsDriver(Node):
             log.error("cannot open GPS %s: %s -- HEADLESS" % (port, exc))
             self._ser = None
         self._pub = self.create_publisher(NavSatFix, TOPIC, qos_profile_sensor_data)
+        self._status_pub = self.create_publisher(
+            String, STATUS_TOPIC, qos_profile_sensor_data)
         self._buf = bytearray()
         self._had_fix = False
+        self._quality = 0
+        self._satellites = None
+        self._heading = None
+        self._latitude = None
+        self._longitude = None
+        self._fix_timestamp_ns = None
+        self._heading_timestamp_ns = None
         self.create_timer(0.1, self._poll)
 
     def _poll(self):
@@ -76,9 +90,16 @@ class GpsDriver(Node):
             del self._buf[:-512]
 
     def _handle(self, line):
-        # any-talker GGA: $GPGGA, $GNGGA, ...
-        if len(line) < 7 or line[0] != "$" or line[3:6] != "GGA":
+        if len(line) < 7 or line[0] != "$":
             return
+        sentence = line[3:6]
+        if sentence == "GGA":
+            self._handle_gga(line)
+        elif sentence in ("RMC", "VTG"):
+            self._handle_course(line, sentence)
+
+    def _handle_gga(self, line):
+        # any-talker GGA: $GPGGA, $GNGGA, ...
         f = line.split(",")
         if len(f) < 10:
             return
@@ -86,8 +107,15 @@ class GpsDriver(Node):
             quality = int(f[6]) if f[6] else 0
         except ValueError:
             quality = 0
+        self._quality = quality
+        self._fix_timestamp_ns = time.monotonic_ns()
+        try:
+            self._satellites = int(f[7]) if f[7] else None
+        except ValueError:
+            self._satellites = None
         lat = _dm_to_deg(f[2], f[3])
         lon = _dm_to_deg(f[4], f[5])
+        self._latitude, self._longitude = lat, lon
         try:
             alt = float(f[9]) if f[9] else 0.0
         except ValueError:
@@ -109,6 +137,36 @@ class GpsDriver(Node):
             msg.status.status = NavSatStatus.STATUS_NO_FIX
         msg.position_covariance_type = NavSatFix.COVARIANCE_TYPE_UNKNOWN
         self._pub.publish(msg)
+        self._publish_status()
+
+    def _handle_course(self, line, sentence):
+        f = line.split(",")
+        # RMC: field 8 is course over ground; VTG: field 1. RMC validity is A.
+        if sentence == "RMC" and (len(f) < 9 or f[2] != "A"):
+            return
+        index = 8 if sentence == "RMC" else 1
+        try:
+            heading = float(f[index]) if len(f) > index and f[index] else None
+        except ValueError:
+            heading = None
+        if heading is not None:
+            self._heading = heading % 360.0
+            self._heading_timestamp_ns = time.monotonic_ns()
+            self._publish_status()
+
+    def _publish_status(self):
+        status = {
+            "timestamp_ns": time.monotonic_ns(),
+            "latitude": self._latitude,
+            "longitude": self._longitude,
+            "heading_deg": self._heading,
+            "heading_timestamp_ns": self._heading_timestamp_ns,
+            "fix_quality": self._quality,
+            "fix_timestamp_ns": self._fix_timestamp_ns,
+            "satellites": self._satellites,
+        }
+        self._status_pub.publish(String(data=json.dumps(
+            status, separators=(",", ":"))))
 
 
 def _on_term(signum, _frame):

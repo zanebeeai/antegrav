@@ -65,6 +65,7 @@ REFRESH_HZ = 10.0          # dashboard redraw rate (lap time updates this fast)
 FONT = 0
 EOL = b"\xff\xff\xff"
 MODE_SCRIPT = "/home/jetson/ethon/ethon_set_mode.sh"
+CAPTURE_CONTROL_SCRIPT = "/usr/local/sbin/ethon-capture-control"
 CLEAR_ESTOP_SCRIPT = "/home/jetson/ethon/ethon_clear_estop.sh"
 
 # encoder -> planner cruise-speed (target_speed_ms) adjustment
@@ -99,6 +100,7 @@ T_HMI_ARM, T_HMI_MODE = "/ethon/hmi/arm", "/ethon/hmi/mode"
 T_HMI_ARMED = "/ethon/hmi/armed"   # authoritative armed STATE from the planner
 T_LAP, T_LAP_MARK = "/ethon/lap", "/ethon/lap/mark"
 T_CORRIDOR = "/ethon/corridor"
+T_CAPTURE_STATUS = "/ethon/capture/status"
 CORRIDOR_STALE_S = 2.0           # ignore corridor warnings older than this
 
 SEG = {
@@ -355,6 +357,11 @@ class WheelBridge(Node):
         self._supply_v = None
         self._mode = "capture"
         self._warn = ""
+        self._capture_state = "offline"
+        self._capture_elapsed_s = 0.0
+        self._capture_free_gb = None
+        self._capture_error = ""
+        self._capture_status_t = 0.0
         self._lap = 0
         self._cur_s = self._last_s = self._best_s = self._delta_s = None
         self._line_set = False
@@ -422,6 +429,8 @@ class WheelBridge(Node):
         # authoritative armed state (latched) -- overrides the immediate
         # button feedback and reflects arm/disarm from the dashboard too.
         self.create_subscription(Bool, T_HMI_ARMED, self._on_armed_state, latched)
+        self.create_subscription(String, T_CAPTURE_STATUS,
+                                 self._on_capture_status, latched)
         self.create_timer(1.0 / REFRESH_HZ, self._refresh)
         self.create_timer(1.0 / LED_PUSH_HZ, self._push_led)
 
@@ -545,6 +554,18 @@ class WheelBridge(Node):
         self._corr_dev = d.get("dev_m")
         self._corr_t = time.monotonic()
 
+    def _on_capture_status(self, m):
+        try:
+            value = json.loads(m.data)
+        except (ValueError, TypeError):
+            return
+        self._capture_state = str(value.get("state", "offline"))
+        self._capture_elapsed_s = float(value.get("elapsed_s") or 0.0)
+        free = value.get("free_gb")
+        self._capture_free_gb = float(free) if isinstance(free, (int, float)) else None
+        self._capture_error = str(value.get("error") or "")
+        self._capture_status_t = time.monotonic()
+
     def _on_lap(self, m):
         try:
             d = json.loads(m.data)
@@ -584,6 +605,8 @@ class WheelBridge(Node):
                        "autonomy" if self._mode == "capture" else "capture")
         elif token in ("arm", "disarm", "estop", "mark", "estop_clear"):
             self._fire(token, None)
+        elif token == "capture_toggle":
+            self._toggle_capture()
         elif token == "enc+":
             self._adjust_target_speed(TARGET_SPEED_STEP)
         elif token == "enc-":
@@ -620,6 +643,22 @@ class WheelBridge(Node):
         back to forward instead of latching reverse forever."""
         if self._reverse_held:
             self._reverse_pub.publish(Bool(data=True))
+
+    def _toggle_capture(self):
+        """Ask systemd to start/stop the recorder; status returns over ROS."""
+        try:
+            subprocess.Popen(
+                ["sudo", "-n", CAPTURE_CONTROL_SCRIPT, "toggle"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self._capture_state = (
+                "stopping" if self._capture_state in ("recording", "starting")
+                else "starting")
+            self._capture_status_t = time.monotonic()
+            self.get_logger().warning("wheel DATA CAPTURE toggle requested")
+        except OSError as exc:
+            self._capture_state = "fault"
+            self._capture_error = str(exc)
+            self.get_logger().warning("capture toggle failed: %s" % exc)
 
     def _adjust_target_speed(self, delta):
         """Encoder detent -> nudge the planner's cruise target (target_speed_ms).
@@ -751,6 +790,14 @@ class WheelBridge(Node):
             self._pico.pump()          # de-frame Nextion touch bytes first
         self._nx.poll()
         kmh = self._speed * 3.6
+        capture_status_age = time.monotonic() - self._capture_status_t
+        if (self._capture_state in ("starting", "stopping") and
+                capture_status_age > 15.0):
+            self._capture_state = "fault"
+            self._capture_error = "service timeout"
+        elif self._capture_state == "recording" and capture_status_age > 3.0:
+            self._capture_state = "fault"
+            self._capture_error = "recorder heartbeat lost"
 
         self._put("cur", BAR_W + 50, 4, LAP_BOX_W, 24,
                   fmt_lap(self._cur_s), GREEN)
@@ -795,13 +842,31 @@ class WheelBridge(Node):
             state, scol = "E-STOP", RED
         elif self._armed:
             state, scol = "ARMED", GREEN
+        elif self._capture_state == "recording":
+            state, scol = "RECORDING", RED
         else:
             state, scol = "DISARMED", DKGREY
         by = SCREEN_H - 52
         self._put("state", 0, by, 158, 24, state, WHITE, scol)
         self._put("mode", 160, by, 158, 24, "MODE:" + self._mode.upper(),
                   BLACK, AMBER)
-        if self._corr_warning():
+        capture_text = ""
+        capture_bg = BLACK
+        if self._capture_state == "recording":
+            capture_text = "REC %dm" % int(self._capture_elapsed_s // 60)
+            if self._capture_free_gb is not None:
+                capture_text += " %.0fG" % self._capture_free_gb
+            capture_bg = DKRED
+        elif self._capture_state in ("starting", "stopping"):
+            capture_text = "CAP " + self._capture_state.upper()
+            capture_bg = AMBER
+        elif self._capture_state in ("fault", "low_space"):
+            capture_text = ("CAP " + self._capture_state.upper())[:18]
+            capture_bg = RED
+        if capture_text:
+            self._put("warn", 320, by, SCREEN_W - 320, 24,
+                      capture_text[:18], WHITE, capture_bg)
+        elif self._corr_warning():
             # dev_m = corridor midline's y offset (+ = left of car), so a
             # positive dev means the CAR sits right of the line
             side = "R" if (self._corr_dev or 0) > 0 else "L"

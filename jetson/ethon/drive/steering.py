@@ -54,6 +54,10 @@ class Steering:
         self.log = logger
 
         self.steer = TalonFX(cfg.steer_can_id, can_bus)
+        # Keep one CANcoder handle for homing and synchronized capture. Creating
+        # a second Phoenix device owner in the recorder would split status-rate
+        # configuration and make timestamps harder to reason about.
+        self.cancoder = CANcoder(cfg.cancoder_can_id, can_bus)
         self._req_foc = PositionTorqueCurrentFOC(0, slot=0)
         self._req_duty = PositionDutyCycle(0, slot=1)
         self._lock_half_rotor = None   # measured half-range (lock-to-lock)
@@ -137,6 +141,11 @@ class Steering:
     def lock_half_rotor(self):
         return self._lock_half_rotor
 
+    @property
+    def column_target(self):
+        """Latest commanded column position in rotations, or None if released."""
+        return self._col_out
+
     # ── homing ───────────────────────────────────────────────────────────
 
     def _home_from_cancoder(self) -> bool:
@@ -148,8 +157,7 @@ class Steering:
         """
         cfg, log = self.cfg, self.log
         try:
-            enc = CANcoder(cfg.cancoder_can_id, self.can_bus)
-            sig = enc.get_absolute_position()
+            sig = self.cancoder.get_absolute_position()
             sig.wait_for_update(SIGNAL_PROBE_TIMEOUT_S)
             if not sig.status.is_ok():
                 log.warning(
@@ -210,8 +218,7 @@ class Steering:
 
         _cc_sig = None
         try:
-            _cc = CANcoder(5, self.can_bus)
-            _cc_sig = _cc.get_absolute_position()
+            _cc_sig = self.cancoder.get_absolute_position()
         except Exception as _exc:
             log.warn("    [cancoder trace] probe setup failed: %s" % _exc)
 
@@ -305,17 +312,19 @@ class Steering:
                       "steering DISABLED (refusing to sweep uncapped).")
             return False
         try:
-            r = find_stop(right, "RIGHT")
+            right_stop = find_stop(right, "RIGHT")
             time.sleep(STEER_HOME_SETTLE_S)
-            l = find_stop(-right, "LEFT") if r is not None else None
+            left_stop = (find_stop(-right, "LEFT")
+                         if right_stop is not None else None)
             self.steer.set_control(self._neutral)
-            if r is None or l is None:
+            if right_stop is None or left_stop is None:
                 log.error("lock-to-lock homing FAILED — did not find both "
-                          "stops (right=%s left=%s). Steering DISABLED." % (r, l))
+                          "stops (right=%s left=%s). Steering DISABLED."
+                          % (right_stop, left_stop))
                 return False
 
-            centre = (r + l) / 2.0
-            half_rotor = abs(r - l) / 2.0
+            centre = (right_stop + left_stop) / 2.0
+            half_rotor = abs(right_stop - left_stop) / 2.0
             margin_rotor = (float(cfg.steer_home_margin_rot)
                             * cfg.steer_belt_ratio)
             self._lock_half_rotor = max(0.0, half_rotor - margin_rotor)
@@ -344,7 +353,7 @@ class Steering:
             self.steer.set_position(float(pos.value) - centre)
             log.warn("steering homed: RIGHT %+.3f / LEFT %+.3f rotor rot, "
                      "half-range %.3f rot (%.3f column rot), centred=%s"
-                     % (r, l, self._lock_half_rotor,
+                     % (right_stop, left_stop, self._lock_half_rotor,
                         self._lock_half_rotor / max(cfg.steer_belt_ratio,
                                                     1e-6), centred))
             if not centred:

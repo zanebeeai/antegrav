@@ -300,6 +300,8 @@ jetson/ethon/
 ├── *.service                  Historical/source service definitions
 ├── *.bak*                     Pre-Git manual snapshots retained verbatim
 ├── drive/                     Modular drivetrain package
+├── v1_capture/                Synchronized MP4/Parquet data-capture package
+├── tests/                     Local pure-logic capture tests
 ├── pico/                      Steering-wheel CircuitPython firmware
 ├── legacy/                    Superseded direct HMI and LED code
 ├── calib/                     Camera calibration and reference images
@@ -311,6 +313,43 @@ jetson/ethon/
     ├── README.md              Artifact-storage explanation
     └── REMOTE_MANIFEST.sha256 Model identity manifest
 ```
+
+## Self-driving v1 data capture (deployed 2026-08-22)
+
+The repository contains a manual `ethon-v1-capture.service` and
+`v1_data_capture.py` for the first imitation-learning dataset. It records the
+wide and narrow CSI cameras as hardware-encoded H.264 MP4, writes synchronized
+frame/CAN/GPS/event Parquet tables, and creates an atomic metadata manifest for
+each run. The implementation and operator details are in
+`jetson/ethon/v1_capture/README.md`; driver-facing commands are in
+`selfdriving/v1/README.md`.
+
+The drive node publishes capture telemetry at the specified 100/50/20 Hz rates
+from its existing Phoenix device owners. A short-lived recorder heartbeat grants
+manual pedal authority only while cameras, telemetry, and storage are healthy;
+manual steering remains released. The former GP19 encoder push-button toggles
+the systemd recorder and the Nextion wheel display shows recorder state, elapsed
+minutes, free space, and faults.
+
+At the default two-camera bitrate, 60 minutes is estimated at 7.45 GB before
+margin. The recorder requires 19.31 GB free for a 60-minute plan or 23.97 GB for
+its configured 90-minute maximum, both including a 25% capture margin and a
+10 GB free-space reserve. The final 2026-08-22 preflight found 40.17 GB free,
+leaving 16.20 GB beyond the guarded 90-minute requirement. ROS, Phoenix,
+PyGObject, PyArrow 25.0.1 with Zstandard, and the required GStreamer elements
+are installed.
+
+The service, root-owned capture-control helper, validated sudo rule, and GP19
+wheel-button firmware are installed. Existing Pico `code.py`, Jetson firmware,
+and root-owned deployment files were backed up before replacement. The capture
+service remains static/inactive by design. Drive telemetry was measured at
+approximately 100 Hz after refreshing Phoenix status signals, with observed
+CTRE transport latency around 10 ms against a 20 ms activation gate.
+
+The first stationary capture remains deliberately gated: run metadata, crop
+confirmation, and both cameras' fixed exposure/gain ranges must be supplied in
+`v1_capture.json`. GPS was publishing but had no fix during the indoor final
+check, so fix quality and course-over-ground must be confirmed outdoors.
 
 ## Known documentation and deployment drift
 
@@ -351,4 +390,3 @@ For subsequent work:
 7. Compare calibration and model manifests before replacing perception assets.
 8. Run read-only preflight checks first; treat any command that can arm, steer,
    or spin a motor as a separate hardware test requiring explicit preparation.
-

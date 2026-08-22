@@ -1,0 +1,22 @@
+# Manual-only v1 recorder. Install but DO NOT enable: the wheel button or an
+# operator starts each run explicitly. Restart=no prevents a crash from silently
+# creating another run and restoring manual-drive authority.
+
+[Unit]
+Description=Ethon self-driving v1 synchronized data capture
+After=network-online.target ethon-can.service ethon-drive.service
+Requires=ethon-can.service ethon-drive.service
+Wants=ethon-gps.service ethon-wheel.service
+Conflicts=ethon-stack.service ethon-capture.service
+
+[Service]
+Type=simple
+User=jetson
+WorkingDirectory=/home/jetson/ethon
+ExecStart=/bin/bash -lc 'source /opt/ros/humble/setup.bash && export ROS_DOMAIN_ID=42 RMW_IMPLEMENTATION=rmw_cyclonedds_cpp ROS_LOCALHOST_ONLY=1 && exec python3 /home/jetson/ethon/v1_data_capture.py'
+Restart=no
+KillSignal=SIGINT
+TimeoutStopSec=45
+
+[Install]
+# Deliberately no WantedBy: recordings must never auto-start at boot.

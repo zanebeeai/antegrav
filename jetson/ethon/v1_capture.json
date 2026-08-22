@@ -1,0 +1,52 @@
+{
+  "data_root": "/home/jetson/ethon/data/raw",
+  "max_duration_minutes": 90,
+  "reserve_free_gb": 10.0,
+  "storage_safety_factor": 1.25,
+  "parquet_row_group_size": 2000,
+  "max_alignment_error_ms": 20.0,
+  "max_ctre_latency_ms": 20.0,
+  "heartbeat_timeout_s": 0.35,
+  "telemetry_start_timeout_s": 30.0,
+  "camera_start_timeout_s": 10.0,
+  "cameras": {
+    "front_wide": {
+      "sensor_id": 1,
+      "sensor_mode": 0,
+      "width": 1280,
+      "height": 720,
+      "fps": 30,
+      "bitrate_mbps": 8.0,
+      "exposure_range": "",
+      "gain_range": "",
+      "white_balance_mode": 1,
+      "crop": {"top": 80, "bottom": 680, "left": 0, "right": 1280}
+    },
+    "front_narrow": {
+      "sensor_id": 0,
+      "sensor_mode": 1,
+      "width": 1280,
+      "height": 720,
+      "fps": 28,
+      "bitrate_mbps": 8.0,
+      "exposure_range": "",
+      "gain_range": "",
+      "white_balance_mode": 1,
+      "crop": {"top": 80, "bottom": 680, "left": 0, "right": 1280}
+    }
+  },
+  "metadata": {
+    "track_name": "unspecified",
+    "track_configuration": "fixed_v1",
+    "track_direction": "unspecified",
+    "driver_identifier": "unspecified",
+    "weather": "unspecified",
+    "lighting": "unspecified",
+    "nominal_speed_m_s": null,
+    "crop_confirmed": false,
+    "wheelbase_m": 1.524,
+    "drive_reduction": 11.46,
+    "known_faults": [],
+    "notes": "front_narrow uses the currently proven 28 FPS sensor mode; verify a 30 FPS mode on hardware before changing it"
+  }
+}

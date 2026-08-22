@@ -13,7 +13,7 @@
 #      back. All the dashboard logic stays on the Jetson (wheel_bridge.py); this
 #      Pico never parses the display content.
 #   3. Wheel buttons (+ rotary encoders) — debounced here, sent up as ASCII
-#      tokens (arm/disarm/estop/mark/mode/brake/reverse_on/reverse_off/
+#      tokens (arm/disarm/estop/mark/mode/brake/capture_toggle/reverse_on/reverse_off/
 #      enc+/enc-/e3+/e3-). Spare GPIOs are scanned and LOGGED on press so a
 #      newly wired button can be identified before mapping (CANDIDATE_PINS).
 #
@@ -81,12 +81,14 @@ BUTTON_MAP = {
     # knob is under the driver's hand works. 2026-08-18.
     board.GP11: "brake",     # encoder R push
     board.GP3: "brake",      # encoder 3 (regen) push
+    # Former encoder-2 push-button, now the dedicated v1 recorder toggle.
+    # Starting capture cannot move the car; stopping it expires pedal authority.
+    board.GP19: "capture_toggle",
 }
 # Hold-to-reverse: needs press AND release tracked, which the press-only
 # keypad above can't do, so it is its own digitalio pin. Moved GP19 -> GP15
 # 2026-08-18: reverse now lives on the dedicated button (identified via the
-# candidate scan), not the old encoder-2 push. GP19 is unmapped/inert (it
-# only shows up in the candidate press log).
+# candidate scan), not the old encoder-2 push. GP19 is the capture toggle.
 REVERSE_PIN = board.GP15
 # Rotary encoder "R": GP12/GP10 = A/B direction channels (GP11 = push button,
 # currently unused). Sends enc+/enc- per detent -> wheel_bridge adjusts target speed.
@@ -97,8 +99,8 @@ ENCODER3_A, ENCODER3_B = board.GP4, board.GP2
 # Rotary encoder 2 (GP18/GP20) — the DEBUG /cmd_vel speed dial — REMOVED
 # 2026-08-18: a dial on the wheel that publishes drive commands directly is
 # too dangerous to leave live while driving. The A/B channels are no longer
-# decoded (wheel_bridge dropped the e2 tokens too); the push button (GP19)
-# stays in use, see REVERSE_PIN.
+# decoded (wheel_bridge dropped the e2 tokens too); its push button (GP19) is
+# now dedicated to v1 data capture.
 
 # Unmapped-button discovery: every spare header GPIO is scanned as an
 # active-low input with a pull-up, and a debounced press/release is LOGGED
@@ -106,9 +108,9 @@ ENCODER3_A, ENCODER3_B = board.GP4, board.GP2
 # press it, and read the pin name from
 #   journalctl -u ethon-wheel | grep "pico: BTN"
 # then give the pin a real mapping above.
-CANDIDATE_PINS = ("GP7", "GP8", "GP9", "GP14", "GP19", "GP21",
-                  "GP26", "GP27", "GP28")   # GP15 left: it became REVERSE;
-                                            # GP19 joined: old e2 push, inert
+CANDIDATE_PINS = ("GP7", "GP8", "GP9", "GP14", "GP21",
+                  "GP26", "GP27", "GP28")   # GP15 is REVERSE; GP19 is now
+                                            # the v1 data-capture toggle
 
 # LED strip layout (the Pico owns the strip, so counts live here).
 N_REAR = 51            # rear brake/tail LEDs, strip indices 0..N_REAR-1

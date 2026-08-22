@@ -68,6 +68,7 @@ class PedalLink:
     def __init__(self, logger):
         self.frac = 0.0
         self._time = 0.0          # last VALID SAMPLE (link liveness)
+        self.sample_timestamp_ns = None  # Jetson monotonic receipt time
         self._engaged = 0.0       # last sample above PEDAL_ENGAGE_FRAC
         self._rx = bytearray()
         self._ser = None
@@ -108,6 +109,7 @@ class PedalLink:
                 continue
             self.frac = _clamp(frac, 0.0, 1.0)
             self._time = time.monotonic()
+            self.sample_timestamp_ns = time.monotonic_ns()
             if self.frac > PEDAL_ENGAGE_FRAC:
                 self._engaged = self._time
             break

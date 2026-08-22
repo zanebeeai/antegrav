@@ -79,6 +79,7 @@ from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import Bool, Float64, String
 
 from .can_bus import apply_device_config, read_faults, resolve_can_bus, signal_value
+from .capture_telemetry import CaptureTelemetry
 from .config import CONFIG_PATH, load_vehicle_config
 from .pedal import DEFAULT_PEDAL_MODE, PedalLink, get_pedal_mode
 from .steering import Steering
@@ -93,6 +94,8 @@ TOPIC_ARMED = "/ethon/hmi/armed"   # latched Bool from the planner; single
 TOPIC_STATUS = "/ethon/drive_status"
 TOPIC_DRIVE_TEST = "/ethon/drive_test"       # bench-test direct duty override (Float64)
 TOPIC_STEER_TEST = "/ethon/steer_test_deg"   # bench-test direct road-angle override (Float64, deg)
+TOPIC_CAPTURE_MANUAL_ENABLE = "/ethon/capture/manual_enable"
+CAPTURE_MANUAL_TIMEOUT_S = 0.35
 
 # ── wheel brake button ──────────────────────────────────────────────────
 # Any of the 3 encoder push-buttons on the wheel (see pico/code.py's
@@ -218,6 +221,12 @@ class EthonDrive(Node):
             QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
                        durability=DurabilityPolicy.TRANSIENT_LOCAL))
         self._status_pub = self.create_publisher(String, TOPIC_STATUS, 10)
+        # The v1 recorder grants manual pedal authority with a short-lived
+        # heartbeat only after both cameras and all writers are healthy. It is
+        # never latched: recorder/ROS death expires it automatically.
+        self._capture_manual_time = 0.0
+        self.create_subscription(
+            Bool, TOPIC_CAPTURE_MANUAL_ENABLE, self._on_capture_manual, 10)
 
         # Driver-adjustable regen (e-brake) strength, nudged live from wheel
         # encoder 3 via set_parameters. Scales the regen current only (drive
@@ -262,6 +271,17 @@ class EthonDrive(Node):
         # hardware, not something the node depends on to come up.
         self._pedal = PedalLink(log)
 
+        # Raw synchronized data source. It owns no actuators and publishes
+        # cached Phoenix signals at their configured 100/50/20 Hz rates.
+        try:
+            self._capture_telemetry = CaptureTelemetry(self)
+        except Exception as exc:
+            # Drive safety/control remains available if a Phoenix API version
+            # lacks one capture-only signal. The recorder will refuse to grant
+            # pedal authority because its telemetry heartbeat never arrives.
+            self._capture_telemetry = None
+            log.error("capture telemetry unavailable: %s" % exc)
+
         # Wheel brake button (see TOPIC_BRAKE above).
         self._brake_time = 0.0
         self.create_subscription(Bool, TOPIC_BRAKE, self._on_brake, 10)
@@ -300,6 +320,12 @@ class EthonDrive(Node):
             if not new:
                 # Let go immediately rather than waiting for the next tick.
                 self._steering.release()
+
+    def _on_capture_manual(self, msg: Bool):
+        if bool(msg.data):
+            self._capture_manual_time = time.monotonic()
+        else:
+            self._capture_manual_time = 0.0
 
     def _on_estop(self, msg: Bool):
         if msg.data:
@@ -376,6 +402,9 @@ class EthonDrive(Node):
         pedal_active = self._pedal.active(now)
         brake_active = (now - brake_t) <= BRAKE_TIMEOUT_S
         reverse_active = (now - reverse_t) <= REVERSE_TIMEOUT_S
+        capture_manual = ((now - self._capture_manual_time) <=
+                          CAPTURE_MANUAL_TIMEOUT_S)
+        manual_authority = self._armed or capture_manual
         # This tick's drive output comes from the selected pedal-mode
         # strategy (pedal.py) rather than the shared v_cmd speed-tracking
         # law below -- only for a plain forward pedal command, never for
@@ -386,9 +415,9 @@ class EthonDrive(Node):
         # Forces v_cmd to 0, i.e. exactly what one-pedal mode already does
         # on a released pedal: full regen decelerate. Same steering
         # hand-back as the pedal (see Steering.tick).
-        if brake_active and self._armed:
+        if brake_active and manual_authority:
             v_cmd, omega = 0.0, 0.0
-        elif pedal_active and self._armed:
+        elif pedal_active and manual_authority:
             if reverse_active:
                 # Hold-to-reverse: the whole pedal travel maps onto the
                 # reduced reverse span, so full pedal is reverse_speed_frac
@@ -572,6 +601,9 @@ class EthonDrive(Node):
             # wheel the way it physically turns instead of assuming a sign.
             "steer_inverted": bool(cfg.steer_inverted),
             "armed": bool(self._armed),
+            "capture_manual_authority": bool(
+                (time.monotonic() - self._capture_manual_time) <=
+                CAPTURE_MANUAL_TIMEOUT_S),
             # Geometry for the dashboard's predicted-trajectory overlay: the
             # bicycle model needs the wheelbase, and the steering envelope
             # needs the road-wheel angle at full lock.
