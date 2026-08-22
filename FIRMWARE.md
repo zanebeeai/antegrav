@@ -346,10 +346,25 @@ service remains static/inactive by design. Drive telemetry was measured at
 approximately 100 Hz after refreshing Phoenix status signals, with observed
 CTRE transport latency around 10 ms against a 20 ms activation gate.
 
-The first stationary capture remains deliberately gated: run metadata, crop
-confirmation, and both cameras' fixed exposure/gain ranges must be supplied in
-`v1_capture.json`. GPS was publishing but had no fix during the indoor final
-check, so fix quality and course-over-ground must be confirmed outdoors.
+Capture defaults are now populated in `v1_capture.json` for the William Rose
+clockwise configuration and driver Greg. Crop and fixed exposure/gain values
+remain provisional and should be validated from the first usable daylight run.
+GPS was publishing but had no fix during the indoor final check, so fix quality
+and course-over-ground must be confirmed outdoors.
+
+The first button-controlled test on 2026-08-22 exposed a shutdown-order fault:
+systemd invalidated the ROS context before the recorder finalized its MP4 and
+Parquet writers. That run contains empty media and header-only Parquet files and
+must not be used. The recorder now handles SIGINT as an internal stop request,
+closes every writer before shutting ROS down, and records any individual
+finalization errors in metadata. The wheel bridge also queries the actual
+systemd state before displaying `CAP STARTING` or `CAP STOPPING` and ignores
+duplicate toggles for one second. This prevents a successful stop from looking
+like an immediate restart when the wheel's cached capture state is stale.
+
+For local inspection, `selfdriving/v1/viewer/` contains a private synchronized
+viewer for the two videos, telemetry traces, events, and run-health warnings.
+Its generated manifests and downloaded run data are excluded from Git.
 
 ## Known documentation and deployment drift
 

@@ -36,6 +36,7 @@ class CaptureService(Node):
         self.repo = repo
         self.log = self.get_logger()
         self._closing = False
+        self._stop_requested = False
         self._healthy = False
         self._activated = False
         self._telemetry_seen = False
@@ -74,7 +75,12 @@ class CaptureService(Node):
         self.sync = FrameSynchronizer(cfg.max_alignment_error_ms)
 
         self.create_subscription(String, TOPIC_TELEMETRY, self._on_telemetry, 100)
-        self.create_subscription(String, TOPIC_GPS, self._on_gps, 20)
+        sensor_qos = QoSProfile(
+            depth=20,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+        self.create_subscription(String, TOPIC_GPS, self._on_gps, sensor_qos)
         self.create_subscription(String, TOPIC_EVENT, self._on_custom_event, 20)
         self.create_subscription(Empty, "/ethon/lap/mark", self._on_lap, 10)
         self.create_subscription(String, "/ethon/hmi/mode", self._on_mode, 10)
@@ -196,6 +202,21 @@ class CaptureService(Node):
         }
         self._status_pub.publish(String(data=json.dumps(payload, separators=(",", ":"))))
 
+    @property
+    def stop_requested(self) -> bool:
+        return self._stop_requested
+
+    def request_stop(self, reason: str, state: str = "stopping",
+                     error: str = "") -> None:
+        """Request a clean spin-loop exit while the ROS context remains valid."""
+        if self._stop_requested:
+            return
+        self._stop_reason = reason
+        self._healthy = False
+        self._stop_requested = True
+        if state:
+            self._publish_status(state, error)
+
     def _monitor(self) -> None:
         if self._closing:
             return
@@ -211,49 +232,33 @@ class CaptureService(Node):
                             "both cameras, telemetry, and writers healthy")
             elif (time.monotonic() - self._started_monotonic >
                   self.cfg.telemetry_start_timeout_s):
-                self._stop_reason = "telemetry_fault"
                 error = "no high-rate drive telemetry received"
                 self._event("can_fault", "telemetry_timeout", error)
-                self._publish_status("fault", error)
-                rclpy.shutdown()
+                self.request_stop("telemetry_fault", "fault", error)
                 return
         elif time.monotonic() - self._last_good_ctre_time > 1.0:
-            self._stop_reason = "telemetry_fault"
             error = "fresh CANcoder/steering telemetry lost"
             self._event("can_fault", "stale_ctre", error)
-            self._publish_status("fault", error)
-            self._healthy = False
-            rclpy.shutdown()
+            self.request_stop("telemetry_fault", "fault", error)
             return
         for writer in (self.frames, self.telemetry, self.events):
             try:
                 writer.check()
             except RuntimeError as error:
-                self._stop_reason = "writer_fault"
-                self._publish_status("fault", str(error))
-                self._healthy = False
-                rclpy.shutdown()
+                self.request_stop("writer_fault", "fault", str(error))
                 return
         for camera in self._cameras:
             error = camera.poll_error()
             if error is not None:
-                self._stop_reason = "camera_fault"
                 self._event("camera_fault", camera.config.name, str(error))
-                self._publish_status("fault", str(error))
-                self._healthy = False
-                rclpy.shutdown()
+                self.request_stop("camera_fault", "fault", str(error))
                 return
         if below_runtime_reserve(self.cfg):
-            self._stop_reason = "low_disk"
             self._event("capture_fault", "low_disk", "runtime reserve reached")
-            self._publish_status("low_space", "runtime reserve reached")
-            self._healthy = False
-            rclpy.shutdown()
+            self.request_stop("low_disk", "low_space", "runtime reserve reached")
             return
         if time.monotonic() - self._started_monotonic >= self.cfg.max_duration_minutes * 60:
-            self._stop_reason = "duration_limit"
-            self._publish_status("stopping")
-            rclpy.shutdown()
+            self.request_stop("duration_limit")
             return
         self._publish_status("recording" if self._activated else "starting")
 
@@ -262,58 +267,79 @@ class CaptureService(Node):
             return
         self._closing = True
         self._healthy = False
-        try:
-            self._manual_pub.publish(Bool(data=False))
-            self._event("recording_stop", self._stop_reason, "")
-            self._publish_status("stopping")
-            for camera in self._cameras:
-                camera.close()
-            self.frames.close()
-            self.telemetry.close()
-            self.events.close()
-            self.metadata.update({
-                "status": "complete" if self._stop_reason in
-                          ("operator_stop", "duration_limit") else "fault",
-                "stop_reason": self._stop_reason,
-                "utc_stop": datetime.now(timezone.utc).isoformat(),
-                "duration_s": round(time.monotonic() - self._started_monotonic, 3),
-                "rows": {
-                    "frames": self.frames.rows_written,
-                    "telemetry": self.telemetry.rows_written,
-                    "events": self.events.rows_written,
-                },
-                "camera_frames": {
-                    camera.config.name: camera.frame_count for camera in self._cameras
-                },
-                "free_gb_at_stop": round(disk_free_gb(self.cfg.data_root), 3),
-            })
-            write_metadata(self.run_dir, self.metadata)
-            self._publish_status("idle")
-        except Exception as exc:
-            self.log.error("capture finalization failed: %s" % exc)
-            self._publish_status("fault", str(exc))
+        errors = []
+
+        def attempt(label, operation):
+            try:
+                operation()
+            except Exception as exc:
+                errors.append("%s: %s" % (label, exc))
+                self.log.error("capture finalization %s failed: %s" % (label, exc))
+
+        if rclpy.ok():
+            attempt("manual disable",
+                    lambda: self._manual_pub.publish(Bool(data=False)))
+            attempt("stopping status", lambda: self._publish_status("stopping"))
+        attempt("stop event",
+                lambda: self._event("recording_stop", self._stop_reason, ""))
+        for camera in self._cameras:
+            attempt("%s video" % camera.config.name, camera.close)
+        for name, writer in (("frames", self.frames),
+                             ("telemetry", self.telemetry),
+                             ("events", self.events)):
+            attempt("%s parquet" % name, writer.close)
+
+        normal_stop = self._stop_reason in ("operator_stop", "duration_limit")
+        self.metadata.update({
+            "status": "complete" if normal_stop and not errors else "fault",
+            "stop_reason": self._stop_reason,
+            "utc_stop": datetime.now(timezone.utc).isoformat(),
+            "duration_s": round(time.monotonic() - self._started_monotonic, 3),
+            "rows": {
+                "frames": self.frames.rows_written,
+                "telemetry": self.telemetry.rows_written,
+                "events": self.events.rows_written,
+            },
+            "camera_frames": {
+                camera.config.name: camera.frame_count for camera in self._cameras
+            },
+            "free_gb_at_stop": round(disk_free_gb(self.cfg.data_root), 3),
+        })
+        if errors:
+            self.metadata["finalization_errors"] = errors
+        attempt("metadata", lambda: write_metadata(self.run_dir, self.metadata))
+        if rclpy.ok():
+            final_state = "idle" if self.metadata["status"] == "complete" else "fault"
+            attempt("final status", lambda: self._publish_status(
+                final_state, "; ".join(errors)))
 
 
 def run(cfg: CaptureConfig, repo: Path) -> int:
     rclpy.init()
     node = None
+    signal_stop_requested = False
 
     def stop(_signum, _frame):
-        if rclpy.ok():
-            rclpy.shutdown()
+        nonlocal signal_stop_requested
+        signal_stop_requested = True
 
     signal.signal(signal.SIGINT, stop)
     signal.signal(signal.SIGTERM, stop)
     try:
         node = CaptureService(cfg, repo)
-        rclpy.spin(node)
+        while (rclpy.ok() and not signal_stop_requested and
+               not node.stop_requested):
+            rclpy.spin_once(node, timeout_sec=0.1)
+        if signal_stop_requested and not node.stop_requested:
+            node.request_stop("operator_stop")
         return 0
     except (KeyboardInterrupt, ExternalShutdownException):
         return 0
     except Exception as exc:
         if node is not None:
             node._stop_reason = "startup_fault"
-            node._publish_status("fault", str(exc))
+            if rclpy.ok():
+                node._publish_status("fault", str(exc))
         print("v1 capture failed: %s" % exc, flush=True)
         return 1
     finally:

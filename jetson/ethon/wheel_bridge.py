@@ -66,6 +66,7 @@ FONT = 0
 EOL = b"\xff\xff\xff"
 MODE_SCRIPT = "/home/jetson/ethon/ethon_set_mode.sh"
 CAPTURE_CONTROL_SCRIPT = "/usr/local/sbin/ethon-capture-control"
+CAPTURE_SERVICE = "ethon-v1-capture.service"
 CLEAR_ESTOP_SCRIPT = "/home/jetson/ethon/ethon_clear_estop.sh"
 
 # encoder -> planner cruise-speed (target_speed_ms) adjustment
@@ -362,6 +363,7 @@ class WheelBridge(Node):
         self._capture_free_gb = None
         self._capture_error = ""
         self._capture_status_t = 0.0
+        self._capture_last_toggle_t = 0.0
         self._lap = 0
         self._cur_s = self._last_s = self._best_s = self._delta_s = None
         self._line_set = False
@@ -646,15 +648,24 @@ class WheelBridge(Node):
 
     def _toggle_capture(self):
         """Ask systemd to start/stop the recorder; status returns over ROS."""
+        now = time.monotonic()
+        if now - self._capture_last_toggle_t < 1.0:
+            self.get_logger().warning("duplicate DATA CAPTURE toggle ignored")
+            return
+        self._capture_last_toggle_t = now
         try:
+            active = subprocess.run(
+                ["systemctl", "is-active", "--quiet", CAPTURE_SERVICE],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                check=False).returncode == 0
             subprocess.Popen(
                 ["sudo", "-n", CAPTURE_CONTROL_SCRIPT, "toggle"],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            self._capture_state = (
-                "stopping" if self._capture_state in ("recording", "starting")
-                else "starting")
-            self._capture_status_t = time.monotonic()
-            self.get_logger().warning("wheel DATA CAPTURE toggle requested")
+            action = "stop" if active else "start"
+            self._capture_state = "stopping" if active else "starting"
+            self._capture_status_t = now
+            self.get_logger().warning(
+                "wheel DATA CAPTURE %s requested" % action)
         except OSError as exc:
             self._capture_state = "fault"
             self._capture_error = str(exc)

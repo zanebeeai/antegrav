@@ -208,6 +208,22 @@ In `metadata.json`, require `status: complete`. A `fault` status, non-empty
 camera/CAN fault events, sustained dropped-frame flags, or alignment errors over
 20 ms means the affected run or interval should be excluded from training.
 
+## Synchronized visual review
+
+The local `viewer/` tool shows both camera streams on one scrubber alongside
+steering, speed, pedal, CTRE latency, GPS, and event markers. After downloading
+a run, prepare and open it with:
+
+```bash
+# On the development PC, from selfdriving/v1/viewer:
+python prepare_run.py ../../../jetson/ethon/data/raw/YYYY-MM-DD/<run_id>
+npm install
+npm run dev
+```
+
+Choose the prepared run directory using **Open run folder**. The viewer remains
+local so raw vehicle video and telemetry are not published.
+
 ## Common failures
 
 | Symptom | Check |
