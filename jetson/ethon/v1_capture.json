@@ -17,8 +17,8 @@
       "height": 720,
       "fps": 30,
       "bitrate_mbps": 8.0,
-      "exposure_range": "",
-      "gain_range": "",
+      "exposure_range": "10000000 10000000",
+      "gain_range": "2 2",
       "white_balance_mode": 1,
       "crop": {"top": 80, "bottom": 680, "left": 0, "right": 1280}
     },
@@ -29,24 +29,26 @@
       "height": 720,
       "fps": 28,
       "bitrate_mbps": 8.0,
-      "exposure_range": "",
-      "gain_range": "",
+      "exposure_range": "10000000 10000000",
+      "gain_range": "2 2",
       "white_balance_mode": 1,
       "crop": {"top": 80, "bottom": 680, "left": 0, "right": 1280}
     }
   },
   "metadata": {
-    "track_name": "unspecified",
-    "track_configuration": "fixed_v1",
-    "track_direction": "unspecified",
-    "driver_identifier": "unspecified",
-    "weather": "unspecified",
-    "lighting": "unspecified",
-    "nominal_speed_m_s": null,
-    "crop_confirmed": false,
+    "track_name": "william_rose",
+    "track_configuration": "default",
+    "track_direction": "clockwise",
+    "driver_identifier": "greg",
+    "weather": "cloudy",
+    "lighting": "daylight",
+    "nominal_speed_m_s": 1.0,
+    "crop_confirmed": true,
     "wheelbase_m": 1.524,
     "drive_reduction": 11.46,
-    "known_faults": [],
-    "notes": "front_narrow uses the currently proven 28 FPS sensor mode; verify a 30 FPS mode on hardware before changing it"
+    "known_faults": [
+      "provisional crop/exposure/gain settings require visual validation before training"
+    ],
+    "notes": "Both cameras provisionally use fixed 10 ms exposure and 2x analog gain for cloudy daylight. The crop is top=80,bottom=680,left=0,right=1280. Validate image brightness and framing in a stationary smoke capture. front_narrow uses the proven 28 FPS sensor mode; verify a 30 FPS mode on hardware before changing it."
   }
 }

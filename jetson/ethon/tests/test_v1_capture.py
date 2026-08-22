@@ -20,9 +20,25 @@ class CaptureConfigTests(unittest.TestCase):
         self.assertAlmostEqual(one_hour.video_gb, 7.2, places=3)
         self.assertAlmostEqual(one_hour.required_free_gb, 19.3125, places=3)
         self.assertAlmostEqual(ninety.required_free_gb, 23.96875, places=3)
-        issues = run_setup_issues(cfg)
+        self.assertEqual(run_setup_issues(cfg), [])
+
+    def test_reports_incomplete_run_setup(self):
+        raw = json.loads((ROOT / "v1_capture.json").read_text(encoding="utf-8"))
+        raw["metadata"]["track_name"] = "unspecified"
+        raw["metadata"]["crop_confirmed"] = False
+        raw["cameras"]["front_wide"]["exposure_range"] = ""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "incomplete.json"
+            path.write_text(json.dumps(raw), encoding="utf-8")
+            issues = run_setup_issues(load_config(path))
         self.assertIn("metadata.track_name is not set", issues)
-        self.assertTrue(any("front_wide exposure_range" in issue for issue in issues))
+        self.assertIn(
+            "metadata.crop_confirmed must be true after the fixed crop is verified",
+            issues,
+        )
+        self.assertTrue(
+            any("front_wide exposure_range" in issue for issue in issues)
+        )
 
     def test_rejects_missing_camera(self):
         raw = json.loads((ROOT / "v1_capture.json").read_text(encoding="utf-8"))
