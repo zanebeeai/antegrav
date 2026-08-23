@@ -23,13 +23,22 @@ npm install
 npm run dev
 ```
 
-Open the local address printed by the command, select **Open run folder**, and
-choose the run directory containing `viewer.json`, both MP4s, and the three
-Parquet files.
+Open the local address printed by the command. The newest locally downloaded
+run opens automatically, and the **Local run** dropdown switches between every
+indexed run without a file picker. `npm run dev` refreshes the index before the
+viewer starts. While it is already running, refresh the list with:
+
+```bash
+npm run index-runs
+```
+
+**Open run folder** remains available for an unindexed directory containing
+`viewer.json`, both MP4s, and the three Parquet files.
 
 The wide video is the master playback clock. The narrow video is continuously
 corrected against its recorded first-frame timestamp. Scrubbing also updates
 both videos and selects the nearest time-aligned telemetry sample.
 
-Run data and generated `viewer.json` files are ignored by Git. Do not deploy a
-viewer containing private capture files to a public host.
+The local index uses filesystem links rather than copying the MP4 files. Run
+data, generated `viewer.json` files, and the index are ignored by Git. Do not
+deploy a viewer containing private capture files to a public host.

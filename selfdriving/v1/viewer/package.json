@@ -6,10 +6,11 @@
     "node": ">=22.13.0"
   },
   "scripts": {
-    "dev": "vinext dev",
+    "index-runs": "python index_runs.py",
+    "dev": "python index_runs.py && vinext dev",
     "build": "vinext build",
     "start": "vinext start",
-    "lint": "eslint . --ignore-pattern dist --ignore-pattern .next"
+    "lint": "eslint . --ignore-pattern dist --ignore-pattern .next --ignore-pattern public/runs"
   },
   "dependencies": {
     "next": "^16.3.2",

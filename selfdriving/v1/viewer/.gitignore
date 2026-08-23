@@ -37,6 +37,7 @@ next-env.d.ts
 /outputs/
 /work/
 /public/run/
+/public/runs/
 
 # Python tooling
 __pycache__/

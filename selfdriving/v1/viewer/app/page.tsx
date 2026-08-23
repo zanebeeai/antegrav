@@ -38,6 +38,17 @@ type RunData = {
 
 type VideoUrls = { wide?: string; narrow?: string };
 
+type RunOption = {
+  run_id: string;
+  label: string;
+  status: string;
+  duration_s: number;
+  health_ok: boolean;
+  manifest_url: string;
+  wide_url?: string | null;
+  narrow_url?: string | null;
+};
+
 const fmt = (value: number | null | undefined, digits = 2) =>
   typeof value === 'number' && Number.isFinite(value) ? value.toFixed(digits) : '—';
 
@@ -93,6 +104,8 @@ function TelemetryPlot({ points, time }: { points: Point[]; time: number }) {
 
 export default function Home() {
   const [run, setRun] = useState<RunData | null>(null);
+  const [availableRuns, setAvailableRuns] = useState<RunOption[]>([]);
+  const [selectedRun, setSelectedRun] = useState('');
   const [loadError, setLoadError] = useState('');
   const [urls, setUrls] = useState<VideoUrls>({});
   const [time, setTime] = useState(0);
@@ -100,20 +113,60 @@ export default function Home() {
   const [rate, setRate] = useState(1);
   const wideRef = useRef<HTMLVideoElement>(null);
   const narrowRef = useRef<HTMLVideoElement>(null);
+  const urlsRef = useRef<VideoUrls>({});
+
+  const replaceUrls = (next: VideoUrls) => {
+    Object.values(urlsRef.current).forEach((url) => {
+      if (url?.startsWith('blob:')) URL.revokeObjectURL(url);
+    });
+    urlsRef.current = next;
+    setUrls(next);
+  };
+
+  const loadIndexedRun = async (option: RunOption) => {
+    try {
+      const response = await fetch(option.manifest_url, { cache: 'no-store' });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const data = await response.json() as RunData;
+      replaceUrls({
+        wide: option.wide_url || undefined,
+        narrow: option.narrow_url || undefined,
+      });
+      setRun(data);
+      setSelectedRun(option.run_id);
+      setLoadError('');
+      setTime(0);
+      setPlaying(false);
+    } catch (error) {
+      setLoadError(`Could not load ${option.run_id}: ${String(error)}`);
+    }
+  };
 
   useEffect(() => {
-    fetch('/run/viewer.json')
+    let cancelled = false;
+    fetch('/runs/index.json', { cache: 'no-store' })
       .then((response) => {
-        if (!response.ok) throw new Error('No prepared run is loaded');
+        if (!response.ok) throw new Error('No local run index is available');
         return response.json();
       })
-      .then((value: RunData) => setRun(value))
-      .catch(() => setLoadError('Open a prepared run folder to begin.'));
+      .then(async (value: { runs?: RunOption[] }) => {
+        const options = value.runs || [];
+        if (cancelled) return;
+        setAvailableRuns(options);
+        if (options.length) await loadIndexedRun(options[0]);
+        else setLoadError('No local captures are indexed.');
+      })
+      .catch(() => setLoadError('No local captures are indexed.'));
+    return () => { cancelled = true; };
+    // Initial discovery runs only once; selection changes use loadIndexedRun.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => () => {
-    Object.values(urls).forEach((url) => url && URL.revokeObjectURL(url));
-  }, [urls]);
+    Object.values(urlsRef.current).forEach((url) => {
+      if (url?.startsWith('blob:')) URL.revokeObjectURL(url);
+    });
+  }, []);
 
   const current = useMemo(() => nearest(run?.telemetry || [], time), [run, time]);
   const duration = Math.max(run?.timeline.duration_s || 0, 0.01);
@@ -166,14 +219,14 @@ export default function Home() {
     }
     try {
       const data = JSON.parse(await manifest.text()) as RunData;
-      Object.values(urls).forEach((url) => url && URL.revokeObjectURL(url));
       const wide = byName.get(data.videos.wide.file);
       const narrow = byName.get(data.videos.narrow.file);
-      setUrls({
+      replaceUrls({
         wide: wide && wide.size ? URL.createObjectURL(wide) : undefined,
         narrow: narrow && narrow.size ? URL.createObjectURL(narrow) : undefined,
       });
       setRun(data);
+      setSelectedRun('');
       setLoadError('');
       setTime(0);
       setPlaying(false);
@@ -186,7 +239,26 @@ export default function Home() {
     <main>
       <header className="topbar">
         <div className="brand"><span className="mark">E</span><div><strong>Ethon Run Inspector</strong><small>Time-synchronized capture review</small></div></div>
-        <label className="open-button">Open run folder<input type="file" multiple {...({ webkitdirectory: '', directory: '' } as object)} onChange={openFolder} /></label>
+        <div className="run-controls">
+          <label className="run-select">
+            <span>Local run</span>
+            <select
+              value={selectedRun}
+              disabled={!availableRuns.length}
+              onChange={(event) => {
+                const option = availableRuns.find((item) => item.run_id === event.target.value);
+                if (option) void loadIndexedRun(option);
+              }}
+            >
+              {!availableRuns.length && <option value="">No indexed runs</option>}
+              {selectedRun === '' && availableRuns.length > 0 && <option value="">Manual folder</option>}
+              {availableRuns.map((option) => (
+                <option key={option.run_id} value={option.run_id}>{option.label}</option>
+              ))}
+            </select>
+          </label>
+          <label className="open-button">Open run folder<input type="file" multiple {...({ webkitdirectory: '', directory: '' } as object)} onChange={openFolder} /></label>
+        </div>
       </header>
 
       <section className="runbar">
