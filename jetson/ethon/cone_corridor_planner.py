@@ -57,10 +57,9 @@ ESTOP_TOPIC = "/ethon/estop"
 HMI_ARM_TOPIC = "/ethon/hmi/arm"   # Nextion arm/disarm soft button (command in)
 HMI_ARMED_TOPIC = "/ethon/hmi/armed"  # authoritative armed STATE out (latched)
 
-# Caps for runtime-settable parameters (absolute, regardless of operator):
-# a fat-fingered `ros2 param set` must not be able to command highway speed.
+# Caps for runtime-settable geometry and hazard parameters. Cruise speed is
+# deliberately not capped here; the requested target is operator-controlled.
 PARAM_CAPS = {
-    "target_speed_ms": 8.0,           # matches the drive node's max_speed_ms
     "hazard_creep_speed_ms": 3.0,
     "max_cone_range_m": 25.0,
     "max_lookahead_m": 12.0,

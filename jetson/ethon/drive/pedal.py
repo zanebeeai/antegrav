@@ -37,6 +37,7 @@ PEDAL_PORT = "/dev/ethon-pedal"   # udev symlink -- TODO once hardware is
                                    # (see 99-ethon-usb.rules)
 PEDAL_BAUD = 115200
 PEDAL_TIMEOUT_S = 0.3              # stale pedal link -> treated as unplugged
+PEDAL_RETRY_S = 1.0                # reopen automatically after unplug/replug
 
 # Link freshness alone CANNOT mean "the human is driving". Measured 2026-08-18:
 # the XIAO streams "0.000" about 90x/second whenever it is merely plugged in, so
@@ -72,14 +73,22 @@ class PedalLink:
         self._engaged = 0.0       # last sample above PEDAL_ENGAGE_FRAC
         self._rx = bytearray()
         self._ser = None
+        self._next_open = 0.0
         self._log = logger
+        self._open()
+
+    def _open(self):
+        """Open the pedal port, retrying quietly after a disconnect."""
         try:
             self._ser = serial.Serial(PEDAL_PORT, PEDAL_BAUD, timeout=0)
-            logger.info("pedal link open on %s" % PEDAL_PORT)
+            self._rx.clear()
+            self._log.info("pedal link open on %s" % PEDAL_PORT)
         except (serial.SerialException, OSError) as exc:
-            logger.warning(
+            self._ser = None
+            self._next_open = time.monotonic() + PEDAL_RETRY_S
+            self._log.warning(
                 "pedal link not available (%s: %s) -- manual-drive pedal "
-                "inert, everything else unaffected" % (PEDAL_PORT, exc))
+                "inert; retrying automatically" % (PEDAL_PORT, exc))
 
     def pump(self):
         """Non-blocking read of the pedal's newline-delimited ASCII stream.
@@ -90,12 +99,25 @@ class PedalLink:
         and replayed late. A partial trailing line is kept for next time.
         """
         if self._ser is None:
-            return
+            if time.monotonic() >= self._next_open:
+                self._open()
+            if self._ser is None:
+                return
         try:
             data = self._ser.read(256)
         except (serial.SerialException, OSError) as exc:
             self._log.warning("pedal link read failed: %s" % exc)
+            try:
+                self._ser.close()
+            except (serial.SerialException, OSError):
+                pass
             self._ser = None
+            self._next_open = time.monotonic() + PEDAL_RETRY_S
+            self.frac = 0.0
+            self._time = 0.0
+            self.sample_timestamp_ns = None
+            self._engaged = 0.0
+            self._rx.clear()
             return
         if not data:
             return

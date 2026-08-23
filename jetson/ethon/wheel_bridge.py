@@ -77,7 +77,6 @@ TARGET_SPEED_DEFAULT = 1.0       # m/s; MUST match the planner default, else
                                  # 5.0 -> 1.0 with the planner for first-
                                  # autonomy bring-up (2026-08-18).
 TARGET_SPEED_STEP = 0.5          # m/s per encoder detent
-TARGET_SPEED_MAX = 8.0           # m/s ceiling (planner also clamps)
 
 # encoder 3 -> drive regen (e-brake) strength adjustment
 DRIVE_NODE = "/ethon_drive"
@@ -675,8 +674,7 @@ class WheelBridge(Node):
         """Encoder detent -> nudge the planner's cruise target (target_speed_ms).
         The set_parameters service only exists while the planner runs (autonomy);
         in capture mode the local value still tracks for the next time it's up."""
-        self._target_speed = max(0.0, min(TARGET_SPEED_MAX,
-                                          self._target_speed + delta))
+        self._target_speed = max(0.0, self._target_speed + delta)
         self.get_logger().info("wheel target_speed_ms -> %.1f" % self._target_speed)
         if not self._planner_params.service_is_ready():
             return
