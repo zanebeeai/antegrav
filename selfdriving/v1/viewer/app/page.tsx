@@ -40,6 +40,7 @@ type VideoUrls = { wide?: string; narrow?: string };
 
 type RunOption = {
   run_id: string;
+  utc_start?: string | null;
   label: string;
   status: string;
   duration_s: number;
@@ -51,6 +52,44 @@ type RunOption = {
 
 const fmt = (value: number | null | undefined, digits = 2) =>
   typeof value === 'number' && Number.isFinite(value) ? value.toFixed(digits) : '—';
+
+const JETSON_UI = 'http://192.168.2.162';
+
+function inferredRunDate(option: RunOption) {
+  if (option.utc_start) {
+    const date = new Date(option.utc_start);
+    if (!Number.isNaN(date.getTime())) return date;
+  }
+  const match = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})/.exec(option.run_id);
+  if (!match) return undefined;
+  const [, year, month, day, hour, minute, second] = match;
+  return new Date(Date.UTC(
+    Number(year), Number(month) - 1, Number(day),
+    Number(hour), Number(minute), Number(second),
+  ));
+}
+
+function readableDuration(seconds: number) {
+  if (!Number.isFinite(seconds) || seconds <= 0) return 'no duration';
+  if (seconds < 60) return `${seconds.toFixed(1)} s`;
+  const minutes = Math.floor(seconds / 60);
+  const remainder = Math.round(seconds % 60);
+  return `${minutes} min ${remainder} s`;
+}
+
+function runLabel(option: RunOption) {
+  const date = inferredRunDate(option);
+  const dateLabel = date
+    ? new Intl.DateTimeFormat(undefined, {
+      year: 'numeric', month: 'short', day: 'numeric',
+      hour: 'numeric', minute: '2-digit', second: '2-digit',
+    }).format(date)
+    : option.run_id;
+  const status = option.status
+    ? option.status.charAt(0).toUpperCase() + option.status.slice(1)
+    : 'Unknown';
+  return `${dateLabel} · ${readableDuration(option.duration_s)} · ${status}`;
+}
 
 function nearest(points: Point[], time: number) {
   if (!points.length) return undefined;
@@ -64,6 +103,21 @@ function nearest(points: Point[], time: number) {
   const left = points[Math.max(0, low - 1)];
   const right = points[low];
   return Math.abs(left.t - time) <= Math.abs(right.t - time) ? left : right;
+}
+
+function heldNumber(points: Point[], time: number, key: keyof Point) {
+  let low = 0;
+  let high = points.length;
+  while (low < high) {
+    const mid = Math.floor((low + high) / 2);
+    if (points[mid].t <= time) low = mid + 1;
+    else high = mid;
+  }
+  for (let index = low - 1; index >= 0; index -= 1) {
+    const value = points[index][key];
+    if (typeof value === 'number' && Number.isFinite(value)) return value;
+  }
+  return undefined;
 }
 
 function TelemetryPlot({ points, time }: { points: Point[]; time: number }) {
@@ -147,9 +201,9 @@ export default function Home() {
     fetch('/runs/index.json', { cache: 'no-store' })
       .then((response) => {
         if (!response.ok) throw new Error('No local run index is available');
-        return response.json();
+        return response.json() as Promise<{ runs?: RunOption[] }>;
       })
-      .then(async (value: { runs?: RunOption[] }) => {
+      .then(async (value) => {
         const options = value.runs || [];
         if (cancelled) return;
         setAvailableRuns(options);
@@ -168,7 +222,18 @@ export default function Home() {
     });
   }, []);
 
-  const current = useMemo(() => nearest(run?.telemetry || [], time), [run, time]);
+  const current = useMemo(() => {
+    const telemetry = run?.telemetry || [];
+    const sample = nearest(telemetry, time);
+    if (!sample) return undefined;
+    return {
+      ...sample,
+      // Speed and supply arrive independently from the other signals. Keep
+      // their latest known values on screen between source samples.
+      speed: heldNumber(telemetry, time, 'speed'),
+      voltage: heldNumber(telemetry, time, 'voltage'),
+    };
+  }, [run, time]);
   const duration = Math.max(run?.timeline.duration_s || 0, 0.01);
 
   const seek = (next: number) => {
@@ -238,7 +303,19 @@ export default function Home() {
   return (
     <main>
       <header className="topbar">
-        <div className="brand"><span className="mark">E</span><div><strong>Ethon Run Inspector</strong><small>Time-synchronized capture review</small></div></div>
+        <div className="brand"><strong>ETHON</strong><small>DATA</small></div>
+        <nav className="dashboard-tabs" role="tablist" aria-label="Ethon dashboard pages">
+          <a role="tab" href={`${JETSON_UI}/v2`}>CONSOLE</a>
+          <a role="tab" href={`${JETSON_UI}/pit2`}>PIT</a>
+          <a role="tab" href={`${JETSON_UI}/replay`}>REPLAY</a>
+          <a role="tab" href="#capture" aria-selected="true">CAPTURE REVIEW</a>
+          <a role="tab" href={`${JETSON_UI}/calib`}>CALIB</a>
+        </nav>
+        <div className="local-state"><span />LOCAL DATA</div>
+      </header>
+
+      <section className="viewer-toolbar" id="capture">
+        <div><strong>Run inspector</strong><small>Time-synchronized capture review</small></div>
         <div className="run-controls">
           <label className="run-select">
             <span>Local run</span>
@@ -253,13 +330,13 @@ export default function Home() {
               {!availableRuns.length && <option value="">No indexed runs</option>}
               {selectedRun === '' && availableRuns.length > 0 && <option value="">Manual folder</option>}
               {availableRuns.map((option) => (
-                <option key={option.run_id} value={option.run_id}>{option.label}</option>
+                <option key={option.run_id} value={option.run_id}>{runLabel(option)}</option>
               ))}
             </select>
           </label>
           <label className="open-button">Open run folder<input type="file" multiple {...({ webkitdirectory: '', directory: '' } as object)} onChange={openFolder} /></label>
         </div>
-      </header>
+      </section>
 
       <section className="runbar">
         <div><span className="eyebrow">RUN</span><h1>{run?.run_id || 'No run loaded'}</h1></div>
@@ -306,8 +383,8 @@ export default function Home() {
       </section>
 
       <section className="telemetry-grid">
-        <div className="metric primary"><span>Vehicle speed</span><strong>{fmt(current?.speed)} <small>m/s</small></strong></div>
-        <div className="metric"><span>Steering shaft</span><strong>{fmt(current?.steer, 3)} <small>rad</small></strong></div>
+        <div className="metric primary"><span>Vehicle speed</span><strong>{fmt(typeof current?.speed === 'number' ? current.speed * 3.6 : current?.speed, 1)} <small>km/h</small></strong></div>
+        <div className="metric"><span>Steering shaft</span><strong>{fmt(typeof current?.steer === 'number' ? current.steer * 180 / Math.PI : current?.steer, 1)} <small>deg</small></strong></div>
         <div className="metric"><span>Pedal</span><strong>{fmt(typeof current?.pedal === 'number' ? current.pedal * 100 : current?.pedal, 1)} <small>%</small></strong></div>
         <div className="metric"><span>CTRE latency</span><strong>{fmt(current?.latency, 1)} <small>ms</small></strong></div>
         <div className="metric"><span>Supply</span><strong>{fmt(current?.voltage, 1)} <small>V</small></strong></div>
