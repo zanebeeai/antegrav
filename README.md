@@ -1,6 +1,6 @@
-# Ethon
+# antegrav
 
-Ethon is a three-wheeled electric vehicle (Team 1360 Electrathon) with an
+antegrav is a three-wheeled electric vehicle with an
 autonomy stack running on an NVIDIA Jetson Orin NX. This repository holds the
 vehicle hardware reference, a backup of the firmware deployed on the Jetson,
 and the self-driving v1 data-capture and review tooling.
